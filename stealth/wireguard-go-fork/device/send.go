@@ -9,9 +9,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -239,6 +241,10 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		if size == 0 || size > MaxContentSize {
+			if n := device.tunDrops.invalidSize.Add(1); n <= 3 {
+				fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=invalid_size n=%d size=%d\n", n, size)
+				os.Stderr.Sync()
+			}
 			continue
 		}
 
@@ -247,34 +253,54 @@ func (device *Device) RoutineReadFromTUN() {
 		// lookup peer
 
 		var peer *Peer
-		var src []byte
+		var src, dst []byte
 		switch elem.packet[0] >> 4 {
 		case ipv4.Version:
 			if len(elem.packet) < ipv4.HeaderLen {
+				if n := device.tunDrops.invalidSize.Add(1); n <= 3 {
+					fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=invalid_size n=%d ver=4 len=%d (short_header)\n", n, len(elem.packet))
+					os.Stderr.Sync()
+				}
 				continue
 			}
-			dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+			dst = elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
 			src = elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
 			peer = device.allowedips.Lookup(dst)
 
 		case ipv6.Version:
 			if len(elem.packet) < ipv6.HeaderLen {
+				if n := device.tunDrops.invalidSize.Add(1); n <= 3 {
+					fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=invalid_size n=%d ver=6 len=%d (short_header)\n", n, len(elem.packet))
+					os.Stderr.Sync()
+				}
 				continue
 			}
-			dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
+			dst = elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
 			src = elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
 			peer = device.allowedips.Lookup(dst)
 
 		default:
+			if n := device.tunDrops.unknownVersion.Add(1); n <= 3 {
+				fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=unknown_version n=%d ver=%d len=%d\n", n, elem.packet[0]>>4, len(elem.packet))
+				os.Stderr.Sync()
+			}
 			device.log.Verbosef("Received packet with unknown IP version")
 		}
 
 		if peer == nil {
+			if n := device.tunDrops.noRoute.Add(1); n <= 3 {
+				fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=no_route n=%d ver=%d dst=%v len=%d\n", n, elem.packet[0]>>4, net.IP(dst), len(elem.packet))
+				os.Stderr.Sync()
+			}
 			continue
 		}
 
 		// Drop packets with unexpected src IP.
 		if device.allowedSrcAddresses != nil && device.isUnexpectedSrcIP(src) {
+			if n := device.tunDrops.unexpectedSrc.Add(1); n <= 3 {
+				fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=unexpected_src n=%d src=%v\n", n, net.IP(src))
+				os.Stderr.Sync()
+			}
 			//device.log.Verbosef("Dropping packet with unexpected src IP: %v (allowed = %v)", src, device.allowedSrcAddresses)
 			continue
 		}
@@ -283,6 +309,11 @@ func (device *Device) RoutineReadFromTUN() {
 			peer.StagePacket(elem)
 			elem = nil
 			peer.SendStagedPackets()
+		} else {
+			if n := device.tunDrops.peerNotRunning.Add(1); n <= 3 {
+				fmt.Fprintf(os.Stderr, "[wg][tun-drop] reason=peer_not_running n=%d peer=%v\n", n, peer)
+				os.Stderr.Sync()
+			}
 		}
 	}
 }
@@ -468,4 +499,47 @@ func (peer *Peer) RoutineSequentialSender() {
 
 		peer.keepKeyFreshSending()
 	}
+}
+
+// TunDropCounts is a point-in-time snapshot of RoutineReadFromTUN discard
+// counters. All fields are diagnostic only.
+type TunDropCounts struct {
+	InvalidSize    uint64 // size==0, size>MaxContentSize, or short IP header
+	UnknownVersion uint64 // IP version nibble is neither 4 nor 6
+	NoRoute        uint64 // allowedips.Lookup miss (peer == nil)
+	UnexpectedSrc  uint64 // isUnexpectedSrcIP
+	PeerNotRunning uint64 // peer exists but !isRunning
+}
+
+// tunDropCounters holds the live per-reason TUN-reader discard counts.
+// Steady-state cost is one atomic Add per dropped packet.
+type tunDropCounters struct {
+	invalidSize    atomic.Uint64
+	unknownVersion atomic.Uint64
+	noRoute        atomic.Uint64
+	unexpectedSrc  atomic.Uint64
+	peerNotRunning atomic.Uint64
+}
+
+// TunDropCounts returns a snapshot of TUN-reader discards per reason.
+func (device *Device) TunDropCounts() TunDropCounts {
+	return TunDropCounts{
+		InvalidSize:    device.tunDrops.invalidSize.Load(),
+		UnknownVersion: device.tunDrops.unknownVersion.Load(),
+		NoRoute:        device.tunDrops.noRoute.Load(),
+		UnexpectedSrc:  device.tunDrops.unexpectedSrc.Load(),
+		PeerNotRunning: device.tunDrops.peerNotRunning.Load(),
+	}
+}
+
+// PeerRunning returns the isRunning state of every configured peer (one
+// entry per peer, order undefined). It exposes no key material.
+func (device *Device) PeerRunning() []bool {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	out := make([]bool, 0, len(device.peers.keyMap))
+	for _, p := range device.peers.keyMap {
+		out = append(out, p.isRunning.Load())
+	}
+	return out
 }

@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v26"
+APP_VERSION = "v29"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -918,13 +918,14 @@ class StealthBackend:
         # never run two engines at once -- concurrent WintunCreateAdapter
         # calls wedge the driver
         _kill_stale_stealth()
-        # unstick the Wintun driver before asking it for an adapter --
-        # a wedged driver blocks CreateAdapter forever (no reboot needed)
-        _recycle_wintun_driver()
+        # NOTE (v29): sc recycle + pnputil rescan were removed from the
+        # connect path. They churn NDIS/PnP on every connect and the data
+        # path measurably degrades with churn (sessions stop receiving).
+        # Unique ifname + nil GUID already fixed creation; orphans are
+        # still cleaned below. Helpers kept for manual use.
         # remove orphaned adapters from killed runs, then settle the PnP
         # tree so the next CreateAdapter does not wedge
         _clean_phantom_adapters()
-        _rescan_pnp_devices()
         ip = _conf_address(conf)
         _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
@@ -1010,17 +1011,44 @@ class StealthBackend:
         if not ok:
             self.disconnect()
             raise TunnelError("could not set tunnel IP:\n" + out.strip())
-        # Roblox-only route via the tunnel
+        # Roblox-only route via the tunnel -- bound to the TUN interface
+        # explicitly (IF <index>): without IF, Windows silently binds the
+        # route to the physical NIC (the /32 TUN address is not recognized
+        # as an on-link gateway), sending Roblox traffic direct = timeout.
+        if_idx = None
+        for _ in range(10):
+            if_idx = _tun_if_index(self._ifname)
+            if if_idx:
+                break
+            time.sleep(1)
+        _stealth_log("tunnel ifindex: %s" % if_idx)
+        if not if_idx:
+            self.disconnect()
+            raise TunnelError("could not find tunnel interface "
+                              "(%s) -- aborting" % self._ifname)
         for net4 in ROBLOX_ALLOWED_IPS:
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
                             for i in (24, 16, 8, 0))
             _run(["route", "delete", addr, "mask", mask])
-            ok, out = _run(["route", "add", addr, "mask", mask, ip])
-            _stealth_log("route add %s: ok=%s" % (net4, ok))
+            ok, out = _run(["route", "add", addr, "mask", mask, ip,
+                            "IF", if_idx])
+            _stealth_log_cmd("route add %s IF %s" % (net4, if_idx), ok, out)
             if not ok:
                 self.disconnect()
                 raise TunnelError("could not add Roblox route:\n" + out.strip())
+        # verify the route really goes through the tunnel (not the LAN)
+        ok, out = _run(["powershell", "-NoProfile", "-Command",
+                        "Find-NetRoute -RemoteIPAddress 128.116.13.3 "
+                        "-ErrorAction SilentlyContinue | Select-Object "
+                        "-First 1 -ExpandProperty InterfaceAlias"],
+                       timeout=20)
+        _stealth_log("route check: ok=%s alias=%s" % (ok, out.strip()[:80]))
+        if ok and out.strip() and \
+                self._ifname.lower() not in out.strip().lower():
+            self.disconnect()
+            raise TunnelError("Roblox route is not using the tunnel "
+                              "(via %s) -- aborting" % out.strip()[:80])
         _stealth_log("=== connect() done ===")
 
     def disconnect(self):
@@ -2276,21 +2304,31 @@ def run_self_tests():
         check("stealth cleanup helpers safe", True)
     except Exception as e:  # noqa: BLE001
         check("stealth cleanup helpers safe", False, repr(e))
-    # v23: PnP rescan must never raise, and the connect sequence must
-    # settle PnP right after phantom cleanup
+    # v27: Roblox route must be bound to the TUN via IF <index>;
+    # resolving an unknown interface must safely return None
+    try:
+        check("tun_if_index safe unknown",
+              _tun_if_index("no-such-if-xyz") is None)
+    except Exception as e:  # noqa: BLE001
+        check("tun_if_index safe unknown", False, repr(e))
+    if _src is None:
+        check("route add binds tunnel IF (skipped frozen)", True)
+    else:
+        check("route add binds tunnel IF", '"IF"' in _src)
+    # v29: connect path must NOT churn NDIS/PnP (no sc recycle, no
+    # pnputil rescan) -- churn degrades the data path; unique ifname
+    # already fixes creation. Helpers still exist and must stay safe.
     try:
         _rescan_pnp_devices()
         check("stealth rescan helper safe", True)
     except Exception as e:  # noqa: BLE001
         check("stealth rescan helper safe", False, repr(e))
     if _src is None:
-        check("connect rescans pnp after phantom cleanup (skipped frozen)",
-              True)
+        check("connect skips pnp churn (skipped frozen)", True)
     else:
-        check("connect rescans pnp after phantom cleanup",
-              "_rescan_pnp_devices()" in _src
-              and _src.find("_clean_phantom_adapters()") <
-              _src.find("_rescan_pnp_devices()"))
+        check("connect skips pnp churn",
+              "_rescan_pnp_devices()" not in _src
+              and "_recycle_wintun_driver()" not in _src)
     # v23: ready is sticky -- a 'status' line must not hide a working tunnel
     # from the connect waiter
     try:

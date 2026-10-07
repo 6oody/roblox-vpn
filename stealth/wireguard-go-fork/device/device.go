@@ -90,8 +90,11 @@ type Device struct {
 	closed   chan struct{}
 	log      *Logger
 
-	handshakeStateChan chan<- HandshakeState
+	handshakeStateChan  chan<- HandshakeState
 	allowedSrcAddresses []net.IP
+
+	// tunDrops counts RoutineReadFromTUN discards per reason (diagnostic).
+	tunDrops tunDropCounters
 }
 
 type HandshakeState int
@@ -297,12 +300,19 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger, handshakeSt
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.handshakeStateChan = handshakeStateChan
-	var allowedSources = strings.Split(allowedSrcAddresses, ",")
-	device.allowedSrcAddresses = make([]net.IP, len(allowedSources))
-	for i, source := range allowedSources {
-		ip := net.ParseIP(source)
-		if ip != nil {
-			device.allowedSrcAddresses[i] = ip
+	// Empty string means "no source restriction" (nil): strings.Split
+	// would otherwise yield [""] -> a non-nil 1-element slice whose nil
+	// entry matches nothing, silently dropping EVERY outbound packet.
+	if allowedSrcAddresses == "" {
+		device.allowedSrcAddresses = nil
+	} else {
+		var allowedSources = strings.Split(allowedSrcAddresses, ",")
+		device.allowedSrcAddresses = make([]net.IP, len(allowedSources))
+		for i, source := range allowedSources {
+			ip := net.ParseIP(strings.TrimSpace(source))
+			if ip != nil {
+				device.allowedSrcAddresses[i] = ip
+			}
 		}
 	}
 	device.closed = make(chan struct{})
@@ -407,7 +417,7 @@ func (device *Device) Close() {
 func (device *Device) UpdateHandshakeState(state HandshakeState) {
 	select {
 	case device.handshakeStateChan <- state:
-	case <- device.closed:
+	case <-device.closed:
 	}
 }
 

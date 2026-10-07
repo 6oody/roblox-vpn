@@ -30,9 +30,11 @@ import (
 )
 
 const (
-	defaultMTU       = 1320 // lower than 1420 to account for TLS+TCP overhead
-	stealthPort      = 443
-	statusInterval   = 2 * time.Second
+	defaultMTU     = 1320 // lower than 1420 to account for TLS+TCP overhead
+	stealthPort    = 443
+	statusInterval = 2 * time.Second
+	// Outer stall backstop; the bind layer (15s) heals first.
+	stallWatchdogAfter = 45 * time.Second
 )
 
 // WgConfig holds the parsed .conf values we need.
@@ -294,6 +296,26 @@ func main() {
 	}
 	tunLog("AFTER IpcSet")
 
+	// Startup config dump (diagnostic, stderr only): peer count + isRunning
+	// state + allowed_ip prefixes as read back from the device. No keys.
+	{
+		var sb strings.Builder
+		var allowed []string
+		peers := 0
+		if err := wgDev.IpcGetOperation(&sb); err == nil {
+			for _, line := range strings.Split(sb.String(), "\n") {
+				if strings.HasPrefix(line, "public_key=") {
+					peers++
+				} else if strings.HasPrefix(line, "allowed_ip=") {
+					allowed = append(allowed, strings.TrimPrefix(line, "allowed_ip="))
+				}
+			}
+		}
+		fmt.Fprintf(os.Stderr, "[stealth][startup] peers=%d running=%v allowed_ips=%q configured=%q\n",
+			peers, wgDev.PeerRunning(), allowed, cfg.AllowedIPs)
+		os.Stderr.Sync()
+	}
+
 	// 5. Up
 	tunLog("BEFORE Up")
 	if err := wgDev.Up(); err != nil {
@@ -310,6 +332,13 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	ticker := time.NewTicker(statusInterval)
 	defer ticker.Stop()
+	// Outer stall backstop: the bind layer (15s) heals first; if no rx/tx
+	// progress at all for 45s after a completed handshake, force a fresh
+	// bind (new TLS connection) via BindUpdate.
+	var lastRx, lastTx int64
+	lastProgress := time.Now()
+	dropTicker := time.NewTicker(30 * time.Second)
+	defer dropTicker.Stop()
 	for {
 		select {
 		case <-sigCh:
@@ -317,8 +346,26 @@ func main() {
 			return
 		case err := <-errChan:
 			emit(StatusLine{Type: "error", Message: "bind error: " + err.Error()})
+		case <-dropTicker.C:
+			d := wgDev.TunDropCounts()
+			fmt.Fprintf(os.Stderr, "[stealth][tun-drops] invalid_size=%d unknown_version=%d no_route=%d unexpected_src=%d peer_not_running=%d\n",
+				d.InvalidSize, d.UnknownVersion, d.NoRoute, d.UnexpectedSrc, d.PeerNotRunning)
+			os.Stderr.Sync()
 		case <-ticker.C:
 			rx, tx, hs := peerStats(wgDev)
+			if rx != lastRx || tx != lastTx {
+				lastRx, lastTx, lastProgress = rx, tx, time.Now()
+			} else if !hs.IsZero() && time.Since(hs) > stallWatchdogAfter &&
+				time.Since(lastProgress) > stallWatchdogAfter {
+				fmt.Fprintf(os.Stderr, "[stealth][watchdog] no rx/tx progress for %v, BindUpdate\n",
+					time.Since(lastProgress))
+				os.Stderr.Sync()
+				if err := wgDev.BindUpdate(); err != nil {
+					emit(StatusLine{Type: "error", Message: "bind reset: " + err.Error()})
+				} else {
+					lastProgress = time.Now() // avoid BindUpdate storm
+				}
+			}
 			emit(StatusLine{
 				Type:          "status",
 				HandshakeOK:   !hs.IsZero(),

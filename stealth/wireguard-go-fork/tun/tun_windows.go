@@ -144,6 +144,11 @@ func (tun *NativeTun) ForceMTU(mtu int) {
 
 // Note: Read() and Write() assume the caller comes only from a single thread; there's no locking.
 
+// tunReadTotal counts packets delivered by the driver to this session
+// (diagnostic for wedged data paths: adapter counters can grow while the
+// session receives nothing).
+var tunReadTotal atomic.Int64
+
 func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 	tun.running.Add(1)
 	defer tun.running.Done()
@@ -164,6 +169,22 @@ retry:
 			copy(buff[offset:], packet)
 			tun.session.ReleaseReceivePacket(packet)
 			tun.rate.update(uint64(packetSize))
+			if c := tunReadTotal.Add(1); c <= 5 || c%100 == 0 {
+				ver, dst := "?", ""
+				if len(packet) > 0 {
+					switch packet[0] >> 4 {
+					case 4:
+						ver = "v4"
+						if len(packet) >= 20 {
+							dst = fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
+						}
+					case 6:
+						ver = "v6"
+					}
+				}
+				fmt.Fprintf(os.Stderr, "[stealth][tunread] #%d %s dst=%s len=%d\n", c, ver, dst, packetSize)
+				os.Stderr.Sync()
+			}
 			return packetSize, nil
 		case windows.ERROR_NO_MORE_ITEMS:
 			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {

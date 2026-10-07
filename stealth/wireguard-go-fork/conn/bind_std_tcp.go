@@ -27,9 +27,9 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
-	"sync/atomic"
 
 	tls "github.com/refraction-networking/utls"
 	server_name_utils "golang.zx2c4.com/wireguard/conn/server_name_utils"
@@ -37,8 +37,16 @@ import (
 
 var lastErrorTimestamp time.Time
 
+const (
+	tcpWriteTimeout = 5 * time.Second
+	// Stall threshold: above RekeyTimeout+KeepaliveTimeout so ordinary
+	// handshake retries are not mistaken for a stall, far below
+	// RejectAfterTime (180s) so session keys survive a reset.
+	tcpStallAfter = 15 * time.Second
+)
+
 var nextHelloIdx atomic.Int32
-var hellos = []tls.ClientHelloID {
+var hellos = []tls.ClientHelloID{
 	tls.HelloChrome_Auto,
 	tls.HelloChrome_120_PQ,
 	tls.HelloChrome_115_PQ,
@@ -56,7 +64,10 @@ type StdNetBindTcp struct {
 	closed        bool
 	log           *Logger
 	errorChan     chan<- error
-	protectSocket func(fd int) int
+	// UnixNano of the last successful readNextPacket; used to detect a
+	// DPI blackhole (open conn, zero progress) and re-dial fresh.
+	lastRx             atomic.Int64
+	protectSocket      func(fd int) int
 	serverNameStrategy server_name_utils.ServerNameStrategy
 
 	tunsafe *TunSafeData
@@ -154,6 +165,7 @@ func (bind *StdNetBindTcp) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 
 	bind.log.Verbosef("TCP/TLS: Open %d", uport)
 	bind.closed = false
+	bind.lastRx.Store(time.Now().UnixNano())
 	return []ReceiveFunc{bind.makeReceiveFunc()}, uport, nil
 }
 
@@ -208,15 +220,21 @@ func (bind *StdNetBindTcp) getConn() (net.Conn, error) {
 		return nil, net.ErrClosed
 	}
 
-	conn, err := bind.getConnInternal()
-	if err != nil {
-		bind.closed = true
-	}
-	return conn, err
+	// NB: no bind.closed=true on transient dial errors; only Close() sets
+	// closed. Otherwise one failed re-dial bricks the bind (net.ErrClosed
+	// forever until Open) instead of retrying on the next Send/recv.
+	return bind.getConnInternal()
 }
 
 func (bind *StdNetBindTcp) getConnInternal() (net.Conn, error) {
 	addr := bind.endpoint.DstToString()
+	// Blackhole reset: stalled-but-open conn (no error, no rx) -> drop it
+	// here under mu so both Send and recv paths re-dial fresh below.
+	if (bind.tls != nil || bind.tcp != nil) && bind.stalledLocked() {
+		bind.log.Errorf("TCP/TLS stalled %.0fs without rx, re-dialing %s",
+			time.Since(time.Unix(0, bind.lastRx.Load())).Seconds(), addr)
+		_ = bind.closeInternal()
+	}
 	if bind.tcp == nil {
 		err := bind.initTcp(addr)
 		if err != nil {
@@ -236,6 +254,28 @@ func (bind *StdNetBindTcp) getConnInternal() (net.Conn, error) {
 	return bind.tls, nil
 }
 
+// resetConn closes and nils the current conn so the next getConn
+// re-dials. Call only when bind.mu is NOT held (Send/recv error paths);
+// getConnInternal does its own reset inline while holding mu.
+func (bind *StdNetBindTcp) resetConn() {
+	bind.mu.Lock()
+	defer bind.mu.Unlock()
+	if bind.closed {
+		return
+	}
+	_ = bind.closeInternal()
+}
+
+// stalledLocked reports no successful rx for tcpStallAfter.
+// Caller must hold bind.mu.
+func (bind *StdNetBindTcp) stalledLocked() bool {
+	rx := bind.lastRx.Load()
+	if rx == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, rx)) > tcpStallAfter
+}
+
 func (bind *StdNetBindTcp) makeReceiveFunc() ReceiveFunc {
 	return func(buff []byte) (int, Endpoint, error) {
 		var err error
@@ -251,6 +291,7 @@ func (bind *StdNetBindTcp) makeReceiveFunc() ReceiveFunc {
 				if !errors.Is(err, net.ErrClosed) {
 					bind.onSocketError(err)
 					bind.logError("recv", err)
+					bind.resetConn()
 				}
 				return 0, bind.endpoint, err
 			}
@@ -266,6 +307,9 @@ func (bind *StdNetBindTcp) makeReceiveFunc() ReceiveFunc {
 
 func (bind *StdNetBindTcp) readNextPacket(conn net.Conn) error {
 	tunSafeHeader := make([]byte, tunSafeHeaderSize)
+	// Unblock a parked ReadFull so the stall reset can fire even with no
+	// tx in flight; cleared below after a successful packet.
+	_ = conn.SetReadDeadline(time.Now().Add(tcpStallAfter))
 	_, err := io.ReadFull(conn, tunSafeHeader)
 	if err != nil {
 		return err
@@ -284,6 +328,8 @@ func (bind *StdNetBindTcp) readNextPacket(conn net.Conn) error {
 
 	bind.tunsafe.onRecvPacket(tunSafeType, wgPacket)
 	bind.currentPacket = bytes.NewReader(wgPacket)
+	_ = conn.SetReadDeadline(time.Time{})
+	bind.lastRx.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -302,10 +348,16 @@ func (bind *StdNetBindTcp) Send(buff []byte, endpoint Endpoint) error {
 	}
 
 	tunSafePacket := bind.tunsafe.wgToTunSafe(buff)
+	// Unblock the single sequential sender when DPI blackholes
+	// post-handshake bytes: Write fails with i/o timeout -> resetConn
+	// so the next Send re-dials fresh instead of parking forever.
+	_ = conn.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
 	_, err = conn.Write(tunSafePacket)
+	_ = conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		bind.onSocketError(err)
 		bind.logError("send", err)
+		bind.resetConn()
 	}
 	return err
 }
