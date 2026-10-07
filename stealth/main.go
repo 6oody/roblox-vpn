@@ -231,12 +231,29 @@ func main() {
 	tunLog("BEFORE CreateStdNetBind endpoint=%s:%d", cfg.EndpointIP, stealthPort)
 	errChan := make(chan error, 1)
 	connLogger := &conn.Logger{
-		Verbosef: func(format string, args ...any) {},
-		Errorf:   func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[stealth] "+format+"\n", args...) },
+		Verbosef: func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[stealth][tls] "+format+"\n", args...)
+			os.Stderr.Sync()
+		},
+		Errorf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[stealth] "+format+"\n", args...) },
 	}
 	protectSocket := func(fd int) int { return 0 } // no-op: split-tunnel avoids routing loop
 	bind := conn.CreateStdNetBind("tls", server_name_utils.ServerNameTop, connLogger, errChan, protectSocket)
 	tunLog("AFTER CreateStdNetBind")
+
+	// Drain socket errors from the START, not after "ready": dial failures
+	// happen DURING Up() on both the main goroutine and the background
+	// receive loop, and the status loop below only begins draining AFTER
+	// "ready" is emitted. An undrained cap-1 errorChan blocks its sender
+	// while holding the bind mutex -- deadlocking Up() forever (no
+	// "ready", 60s silent hang). This goroutine keeps the channel flowing
+	// for the life of the process.
+	go func() {
+		for err := range errChan {
+			fmt.Fprintf(os.Stderr, "[stealth][net] socket error: %v\n", err)
+			os.Stderr.Sync()
+		}
+	}()
 
 	// 3. WireGuard device
 	tunLog("BEFORE NewDevice")

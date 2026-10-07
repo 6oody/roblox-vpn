@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v24"
+APP_VERSION = "v25"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
