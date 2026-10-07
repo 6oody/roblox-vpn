@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v22"
+APP_VERSION = "v23"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -716,6 +716,59 @@ def _clean_phantom_adapters():
     time.sleep(2)
 
 
+def _rescan_pnp_devices():
+    """Re-enumerate PnP devices after phantom-adapter removal.
+
+    Lets Windows settle the device tree after _clean_phantom_adapters()
+    so a half-removed wintun stack does not wedge the next
+    WintunCreateAdapter. Never raises.
+    """
+    if os.name != "nt":
+        return
+    _stealth_log("rescanning PnP devices ...")
+    ok, out = _run(["pnputil", "/scan-devices"], timeout=30)
+    _stealth_log("pnputil scan-devices: ok=%s out=%s"
+                 % (ok, out.strip()[:200]))
+    time.sleep(2)
+
+
+def _reenable_wintun_device():
+    """Disable/enable a non-OK WireGuard Tunnel device without rebooting.
+
+    Orphan removal (and v20's DeleteDriver residue) can leave the wintun
+    device flagged 'restart required', which blocks interface finalization
+    until reboot. A disable+enable cycle clears it in place. Only touches
+    non-OK 'WireGuard Tunnel*' net devices; a healthy driver (Status OK)
+    is left alone. Never raises.
+    """
+    if os.name != "nt":
+        return
+    _stealth_log("checking WireGuard Tunnel device status ...")
+    ps = ("Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | "
+          "Where-Object { $_.FriendlyName -like 'WireGuard Tunnel*' -and "
+          "$_.Status -ne 'OK' } | "
+          "ForEach-Object { $_.InstanceId }")
+    ok, out = _run(["powershell", "-NoProfile", "-Command", ps], timeout=20)
+    _stealth_log("wintun status enum: ok=%s out=%s"
+                 % (ok, out.strip()[:200]))
+    if not ok or not out.strip():
+        _stealth_log("wintun device OK (or absent); no re-enable needed")
+        return
+    for inst in out.strip().split():
+        inst = inst.strip()
+        if not inst:
+            continue
+        _stealth_log("re-enabling wintun device: %s" % inst[:80])
+        ok1, out1 = _run(["pnputil", "/disable-device", inst], timeout=20)
+        _stealth_log("pnputil disable: ok=%s out=%s"
+                     % (ok1, out1.strip()[:120]))
+        time.sleep(1)
+        ok2, out2 = _run(["pnputil", "/enable-device", inst], timeout=20)
+        _stealth_log("pnputil enable: ok=%s out=%s"
+                     % (ok2, out2.strip()[:120]))
+    time.sleep(2)
+
+
 def _reinstall_wintun_driver(dll_path):
     """Force a clean Wintun driver reinstall via WintunDeleteDriver.
 
@@ -843,6 +896,8 @@ class StealthBackend:
         self._exe = None
         self._if_ip = None
         self._connect_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._saw_ready = False
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -867,8 +922,12 @@ class StealthBackend:
                 except ValueError:
                     continue
                 _stealth_log("engine -> %s" % line[:200])
-                with threading.Lock():
+                with self._state_lock:
                     self._latest = d
+                    # sticky: 'ready' is emitted once, then 'status' every
+                    # 2s overwrites it -- a slow poller must not miss it
+                    if d.get("type") in ("ready", "status"):
+                        self._saw_ready = True
         except Exception as e:
             _stealth_log("reader thread ended: %s" % e)
 
@@ -895,6 +954,10 @@ class StealthBackend:
         _recycle_wintun_driver()
         # remove orphaned adapters from killed runs
         _clean_phantom_adapters()
+        # settle the PnP tree + clear any 'restart required' flag left by
+        # orphan removal, so the next CreateAdapter does not wedge
+        _rescan_pnp_devices()
+        _reenable_wintun_device()
         ip = _conf_address(conf)
         _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
@@ -913,6 +976,7 @@ class StealthBackend:
             _stealth_log("dll copy failed: %s" % e)
         self._stop_reader.clear()
         self._latest = {}
+        self._saw_ready = False
         # unique interface name per attempt (avoids stale name/GUID state)
         self._ifname = _unique_ifname()
         _stealth_log("interface name: %s" % self._ifname)
@@ -934,16 +998,23 @@ class StealthBackend:
             _stealth_log("Popen failed: %r" % e)
             raise TunnelError("could not start stealth engine:\n%s" % e)
         _stealth_log("process started, pid=%s" % self.proc.pid)
+        try:
+            err_log.close()
+        except Exception:
+            pass
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         # wait for ready (up to 60s; TLS+handshake takes a while, and a
-        # slow driver should get a chance)
+        # slow driver should get a chance). 'status' counts as ready too:
+        # the engine emits 'ready' once then 'status' every 2s, and a
+        # slow poller must not miss the window on a working tunnel.
         deadline = time.time() + 60
         err_msg = None
         while time.time() < deadline:
-            with threading.Lock():
+            with self._state_lock:
                 d = dict(self._latest)
-            if d.get("type") == "ready":
+                saw = self._saw_ready
+            if d.get("type") == "ready" or saw:
                 _stealth_log("got READY from engine")
                 break
             if d.get("type") == "error":
@@ -997,12 +1068,18 @@ class StealthBackend:
             except Exception:
                 try:
                     self.proc.kill()
-                except Exception:
-                    pass
+                    self.proc.wait(timeout=5)
+                except Exception as e:
+                    _stealth_log("stealth engine kill: %r" % e)
+            try:
+                if self.proc.stdout:
+                    self.proc.stdout.close()
+            except Exception:
+                pass
         self.proc = None
 
     def get_stats(self):
-        with threading.Lock():
+        with self._state_lock:
             d = dict(self._latest)
         if d.get("type") not in ("status", "ready"):
             return None
@@ -2204,11 +2281,19 @@ def run_self_tests():
     # v16 shipped creationflags=_no_window() which passes a dict where
     # Popen expects an int -> TypeError -> silent thread death, UI hangs
     # on "Connecting..." forever. Guard the source directly.
+    # NOTE: inspect.getsource raises OSError inside the frozen PyInstaller
+    # exe (no .py source bundled) -- skip source-grep checks there.
     import inspect as _inspect
-    _src = _inspect.getsource(StealthBackend._connect_inner)
-    check("stealth popen unpacks no_window",
-          "creationflags=_no_window()" not in _src
-          and "**_no_window()" in _src)
+    try:
+        _src = _inspect.getsource(StealthBackend._connect_inner)
+    except OSError:
+        _src = None
+    if _src is None:
+        check("stealth popen unpacks no_window (skipped frozen)", True)
+    else:
+        check("stealth popen unpacks no_window",
+              "creationflags=_no_window()" not in _src
+              and "**_no_window()" in _src)
     # wintun driver recycle must never raise (sc missing on linux is fine)
     try:
         r = _recycle_wintun_driver()
@@ -2222,6 +2307,32 @@ def run_self_tests():
         check("stealth cleanup helpers safe", True)
     except Exception as e:  # noqa: BLE001
         check("stealth cleanup helpers safe", False, repr(e))
+    # v23: PnP rescan + wintun re-enable must never raise either, and the
+    # connect sequence must settle PnP right after phantom cleanup
+    try:
+        _rescan_pnp_devices()
+        _reenable_wintun_device()
+        check("stealth pnp helpers safe", True)
+    except Exception as e:  # noqa: BLE001
+        check("stealth pnp helpers safe", False, repr(e))
+    if _src is None:
+        check("connect rescans pnp after phantom cleanup (skipped frozen)",
+              True)
+    else:
+        check("connect rescans pnp after phantom cleanup",
+              "_rescan_pnp_devices()" in _src
+              and "_reenable_wintun_device()" in _src
+              and _src.find("_clean_phantom_adapters()") <
+              _src.find("_rescan_pnp_devices()"))
+    # v23: ready is sticky -- a 'status' line must not hide a working tunnel
+    # from the connect waiter
+    try:
+        _sb3 = StealthBackend()
+        _sb3._latest = {"type": "status", "rx_bytes": 1}
+        _sb3._saw_ready = True
+        check("stealth ready sticky", _sb3._saw_ready is True)
+    except Exception as e:  # noqa: BLE001
+        check("stealth ready sticky", False, repr(e))
     # concurrent connects are rejected, not run in parallel
     _sb2 = StealthBackend()
     _got = _sb2._connect_lock.acquire(blocking=False)

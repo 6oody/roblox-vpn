@@ -66,7 +66,11 @@ func CreateTUN(ifname string, mtu int) (Device, error) {
 // CreateTUNWithRequestedGUID creates a Wintun interface with the given name and
 // a requested GUID. Should a Wintun interface with the same name exist, it is reused.
 func CreateTUNWithRequestedGUID(ifname string, requestedGUID *windows.GUID, mtu int) (Device, error) {
+	fmt.Fprintf(os.Stderr, "[stealth][tun] BEFORE CreateAdapter ifname=%s\n", ifname)
+	os.Stderr.Sync()
 	wt, err := wintun.CreateAdapter(ifname, WintunTunnelType, requestedGUID)
+	fmt.Fprintf(os.Stderr, "[stealth][tun] AFTER CreateAdapter err=%v\n", err)
+	os.Stderr.Sync()
 	if err != nil {
 		return nil, fmt.Errorf("Error creating interface: %w", err)
 	}
@@ -84,7 +88,11 @@ func CreateTUNWithRequestedGUID(ifname string, requestedGUID *windows.GUID, mtu 
 		forcedMTU: forcedMTU,
 	}
 
+	fmt.Fprintf(os.Stderr, "[stealth][tun] BEFORE StartSession ifname=%s\n", ifname)
+	os.Stderr.Sync()
 	tun.session, err = wt.StartSession(0x800000) // Ring capacity, 8 MiB
+	fmt.Fprintf(os.Stderr, "[stealth][tun] AFTER StartSession err=%v\n", err)
+	os.Stderr.Sync()
 	if err != nil {
 		tun.wt.Close()
 		close(tun.events)

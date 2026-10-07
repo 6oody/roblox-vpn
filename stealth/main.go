@@ -60,6 +60,15 @@ func emit(s StatusLine) {
 	fmt.Println(string(b))
 }
 
+// tunLog writes a TUN-setup stage marker to stderr and flushes immediately.
+// Python captures stderr into stealth-go-stderr.log, so even if the Wintun
+// driver wedges the process on the NEXT call, the last reached stage is on
+// disk and pinpoints the hanging sub-call.
+func tunLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[stealth][tun] "+format+"\n", args...)
+	os.Stderr.Sync()
+}
+
 func parseConf(path string) (*WgConfig, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -165,11 +174,33 @@ func main() {
 	}
 
 	// 1. TUN device (with timeout: a stuck Wintun driver can block
-	// CreateTUN forever -- fail with a clear message instead of hanging)
+	// CreateTUN forever -- fail with a clear message instead of hanging).
+	// NOTE: the SetupAPI/driver call inside CreateTUN has been observed to
+	// wedge the whole runtime, so the select-timeout below is only the first
+	// backstop. A watchdog goroutine started BEFORE the blocking call
+	// force-exits via os.Exit even if the main goroutine never gets
+	// scheduled again; the Python frontend's 60s ready-wait then reports the
+	// failure. Flushed BEFORE/AFTER stage logs pinpoint the hanging
+	// sub-call (the fork's CreateTUNWithRequestedGUID logs each of
+	// CreateAdapter/StartSession).
 	type tunResult struct {
 		dev tun.Device
 		err error
 	}
+	tunDone := make(chan struct{})
+	go func() {
+		select {
+		case <-tunDone:
+			return // TUN came up; watchdog stands down
+		case <-time.After(30 * time.Second):
+			fmt.Fprintln(os.Stderr, "[stealth][tun] WATCHDOG: TUN setup stuck 30s, force-exit")
+			os.Stderr.Sync()
+			emit(StatusLine{Type: "error", Message: "Wintun adapter creation timed out " +
+				"(driver stuck, watchdog). See stealth-go-stderr.log for the last BEFORE/AFTER stage."})
+			os.Exit(1)
+		}
+	}()
+	tunLog("BEFORE CreateTUN ifname=%s mtu=%d", ifName, defaultMTU)
 	tunCh := make(chan tunResult, 1)
 	go func() {
 		// nil GUID: let the driver generate a fresh one each time.
@@ -181,16 +212,20 @@ func main() {
 	var tunDev tun.Device
 	select {
 	case r := <-tunCh:
+		tunLog("AFTER CreateTUN err=%v", r.err)
 		if r.err != nil {
 			emit(StatusLine{Type: "error", Message: "create TUN: " + r.err.Error()})
 			os.Exit(1)
 		}
 		tunDev = r.dev
 	case <-time.After(25 * time.Second):
+		tunLog("TIMEOUT CreateTUN after 25s")
 		emit(StatusLine{Type: "error", Message: "Wintun adapter creation timed out " +
 			"(driver stuck). Please restart your PC and try again."})
 		os.Exit(1)
 	}
+	close(tunDone)
+	tunLog("TUN ready ifname=%s", ifName)
 
 	// 2. Stealth bind (TLS over TCP/443, Chrome-fingerprint uTLS, decoy SNI)
 	errChan := make(chan error, 1)
