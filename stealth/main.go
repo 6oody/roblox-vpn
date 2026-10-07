@@ -228,6 +228,7 @@ func main() {
 	tunLog("TUN ready ifname=%s", ifName)
 
 	// 2. Stealth bind (TLS over TCP/443, Chrome-fingerprint uTLS, decoy SNI)
+	tunLog("BEFORE CreateStdNetBind endpoint=%s:%d", cfg.EndpointIP, stealthPort)
 	errChan := make(chan error, 1)
 	connLogger := &conn.Logger{
 		Verbosef: func(format string, args ...any) {},
@@ -235,11 +236,14 @@ func main() {
 	}
 	protectSocket := func(fd int) int { return 0 } // no-op: split-tunnel avoids routing loop
 	bind := conn.CreateStdNetBind("tls", server_name_utils.ServerNameTop, connLogger, errChan, protectSocket)
+	tunLog("AFTER CreateStdNetBind")
 
 	// 3. WireGuard device
+	tunLog("BEFORE NewDevice")
 	devLogger := device.NewLogger(device.LogLevelError, "wg: ")
 	wgDev := device.NewDevice(tunDev, bind, devLogger, nil, "")
 	defer wgDev.Close()
+	tunLog("AFTER NewDevice")
 
 	// 4. Configure via IPC
 	var ipc strings.Builder
@@ -255,18 +259,23 @@ func main() {
 		}
 	}
 	fmt.Fprintf(&ipc, "persistent_keepalive_interval=%d\n", cfg.PersistentKeepalive)
+	tunLog("BEFORE IpcSet")
 	if err := wgDev.IpcSet(ipc.String()); err != nil {
 		emit(StatusLine{Type: "error", Message: "configure device: " + err.Error()})
 		os.Exit(1)
 	}
+	tunLog("AFTER IpcSet")
 
 	// 5. Up
+	tunLog("BEFORE Up")
 	if err := wgDev.Up(); err != nil {
 		emit(StatusLine{Type: "error", Message: "device up: " + err.Error()})
 		os.Exit(1)
 	}
+	tunLog("AFTER Up")
 
 	emit(StatusLine{Type: "ready", Message: "stealth tunnel up, waiting for handshake"})
+	tunLog("EMITTED ready")
 
 	// 6. Status loop
 	sigCh := make(chan os.Signal, 1)
