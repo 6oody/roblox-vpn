@@ -258,7 +258,18 @@ func main() {
 	// 3. WireGuard device
 	tunLog("BEFORE NewDevice")
 	devLogger := device.NewLogger(device.LogLevelError, "wg: ")
-	wgDev := device.NewDevice(tunDev, bind, devLogger, nil, "")
+	// A real (buffered + drained) handshake-state channel: passing nil
+	// deadlocks Up() forever inside UpdateHandshakeState -- the send
+	// `handshakeStateChan <- HandshakeInit` never has a receiver and the
+	// `closed` channel is never closed yet. Zero logging, no dial, no
+	// error: exactly the 60s silent hang seen in the field.
+	hsChan := make(chan device.HandshakeState, 100)
+	go func() {
+		for st := range hsChan {
+			tunLog("handshake state: %d", int(st))
+		}
+	}()
+	wgDev := device.NewDevice(tunDev, bind, devLogger, hsChan, "")
 	defer wgDev.Close()
 	tunLog("AFTER NewDevice")
 

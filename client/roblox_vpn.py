@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v25"
+APP_VERSION = "v26"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -685,8 +685,7 @@ def _kill_stale_stealth():
     if os.name != "nt":
         return
     ok, out = _run(["taskkill", "/F", "/IM", "stealth-wg.exe"], timeout=10)
-    _stealth_log("taskkill stealth-wg.exe: ok=%s out=%s"
-                 % (ok, out.strip()[:120]))
+    _stealth_log_cmd("taskkill stealth-wg.exe", ok, out)
 
 
 def _clean_phantom_adapters():
@@ -702,7 +701,7 @@ def _clean_phantom_adapters():
           "Where-Object { $_.FriendlyName -like 'RobloxVPN*' } | "
           "ForEach-Object { $_.InstanceId }")
     ok, out = _run(["powershell", "-NoProfile", "-Command", ps], timeout=20)
-    _stealth_log("pnp enum: ok=%s out=%s" % (ok, out.strip()[:300]))
+    _stealth_log_cmd("pnp enum", ok, out, ok_cap=300)
     if not ok or not out.strip():
         return
     for inst in out.strip().split():
@@ -711,9 +710,17 @@ def _clean_phantom_adapters():
             continue
         _stealth_log("removing phantom device: %s" % inst[:80])
         ok2, out2 = _run(["pnputil", "/remove-device", inst], timeout=20)
-        _stealth_log("pnputil remove: ok=%s out=%s"
-                     % (ok2, out2.strip()[:120]))
+        _stealth_log_cmd("pnputil remove", ok2, out2)
     time.sleep(2)
+
+
+def _stealth_log_cmd(name, ok, out, ok_cap=200):
+    """Log a helper-command result; full output on failure, capped on ok."""
+    out = out.strip()
+    if ok:
+        _stealth_log("%s: ok=%s out=%s" % (name, ok, out[:ok_cap]))
+    else:
+        _stealth_log("%s: ok=%s FULL-OUT=%s" % (name, ok, out))
 
 
 def _rescan_pnp_devices():
@@ -727,45 +734,7 @@ def _rescan_pnp_devices():
         return
     _stealth_log("rescanning PnP devices ...")
     ok, out = _run(["pnputil", "/scan-devices"], timeout=30)
-    _stealth_log("pnputil scan-devices: ok=%s out=%s"
-                 % (ok, out.strip()[:200]))
-    time.sleep(2)
-
-
-def _reenable_wintun_device():
-    """Disable/enable a non-OK WireGuard Tunnel device without rebooting.
-
-    Orphan removal (and v20's DeleteDriver residue) can leave the wintun
-    device flagged 'restart required', which blocks interface finalization
-    until reboot. A disable+enable cycle clears it in place. Only touches
-    non-OK 'WireGuard Tunnel*' net devices; a healthy driver (Status OK)
-    is left alone. Never raises.
-    """
-    if os.name != "nt":
-        return
-    _stealth_log("checking WireGuard Tunnel device status ...")
-    ps = ("Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | "
-          "Where-Object { $_.FriendlyName -like 'WireGuard Tunnel*' -and "
-          "$_.Status -ne 'OK' } | "
-          "ForEach-Object { $_.InstanceId }")
-    ok, out = _run(["powershell", "-NoProfile", "-Command", ps], timeout=20)
-    _stealth_log("wintun status enum: ok=%s out=%s"
-                 % (ok, out.strip()[:200]))
-    if not ok or not out.strip():
-        _stealth_log("wintun device OK (or absent); no re-enable needed")
-        return
-    for inst in out.strip().split():
-        inst = inst.strip()
-        if not inst:
-            continue
-        _stealth_log("re-enabling wintun device: %s" % inst[:80])
-        ok1, out1 = _run(["pnputil", "/disable-device", inst], timeout=20)
-        _stealth_log("pnputil disable: ok=%s out=%s"
-                     % (ok1, out1.strip()[:120]))
-        time.sleep(1)
-        ok2, out2 = _run(["pnputil", "/enable-device", inst], timeout=20)
-        _stealth_log("pnputil enable: ok=%s out=%s"
-                     % (ok2, out2.strip()[:120]))
+    _stealth_log_cmd("pnputil scan-devices", ok, out)
     time.sleep(2)
 
 
@@ -952,12 +921,10 @@ class StealthBackend:
         # unstick the Wintun driver before asking it for an adapter --
         # a wedged driver blocks CreateAdapter forever (no reboot needed)
         _recycle_wintun_driver()
-        # remove orphaned adapters from killed runs
+        # remove orphaned adapters from killed runs, then settle the PnP
+        # tree so the next CreateAdapter does not wedge
         _clean_phantom_adapters()
-        # settle the PnP tree + clear any 'restart required' flag left by
-        # orphan removal, so the next CreateAdapter does not wedge
         _rescan_pnp_devices()
-        _reenable_wintun_device()
         ip = _conf_address(conf)
         _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
@@ -1028,7 +995,9 @@ class StealthBackend:
             time.sleep(0.3)
         else:
             err_msg = "stealth engine did not become ready in time"
-            _stealth_log("TIMEOUT waiting for ready; last status: %s" % d)
+            _stealth_log("TIMEOUT waiting for ready; last status: %s; "
+                         "engine poll=%s (None = still hung, will kill)"
+                         % (d, self.proc.poll()))
         if err_msg:
             self.disconnect()
             raise TunnelError(err_msg)
@@ -2307,21 +2276,19 @@ def run_self_tests():
         check("stealth cleanup helpers safe", True)
     except Exception as e:  # noqa: BLE001
         check("stealth cleanup helpers safe", False, repr(e))
-    # v23: PnP rescan + wintun re-enable must never raise either, and the
-    # connect sequence must settle PnP right after phantom cleanup
+    # v23: PnP rescan must never raise, and the connect sequence must
+    # settle PnP right after phantom cleanup
     try:
         _rescan_pnp_devices()
-        _reenable_wintun_device()
-        check("stealth pnp helpers safe", True)
+        check("stealth rescan helper safe", True)
     except Exception as e:  # noqa: BLE001
-        check("stealth pnp helpers safe", False, repr(e))
+        check("stealth rescan helper safe", False, repr(e))
     if _src is None:
         check("connect rescans pnp after phantom cleanup (skipped frozen)",
               True)
     else:
         check("connect rescans pnp after phantom cleanup",
               "_rescan_pnp_devices()" in _src
-              and "_reenable_wintun_device()" in _src
               and _src.find("_clean_phantom_adapters()") <
               _src.find("_rescan_pnp_devices()"))
     # v23: ready is sticky -- a 'status' line must not hide a working tunnel
