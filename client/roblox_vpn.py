@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v38"
+APP_VERSION = "v39"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -97,6 +97,7 @@ ROBLOX_HOSTS = [
     "c7.rbxcdn.com",
     "sc0gcp.rbxcdn.com",
     "hls-segments.rbxcdn.com",
+    "tr.rbxcdn.com",
     # FEATURE APIs
     "avatar.roblox.com",
     "catalog.roblox.com",
@@ -1032,6 +1033,385 @@ def _extend_conf_for_extra_ips(conf_path, extra_ips):
         return None
 
 
+def matches_suffix(name):
+    n = name.lower().rstrip(".")
+    for s in WildcardDnsProxy.SUFFIXES:
+        bare = s[1:]
+        if n == bare or n.endswith(s):
+            return True
+    return False
+
+
+def _encode_qname(labels):
+    out = b""
+    for lb in labels:
+        b = lb.encode("ascii", "ignore")[:63]
+        out += bytes((len(b),)) + b
+    return out + b"\x00"
+
+
+def parse_query(data):
+    """Parse a DNS query -> (qid, labels, qtype) or None."""
+    try:
+        import struct as _st
+        if data is None or len(data) < 12:
+            return None
+        qid, flags, qdcount, _, _, _ = _st.unpack("!HHHHHH", data[:12])
+        if qdcount != 1:
+            return None
+        off = 12
+        labels = []
+        while True:
+            if off >= len(data):
+                return None
+            ln = data[off]
+            if ln & 0xC0:
+                return None
+            if ln == 0:
+                off += 1
+                break
+            off += 1
+            if off + ln > len(data):
+                return None
+            labels.append(data[off:off + ln].decode("ascii", "ignore"))
+            off += ln
+            if len(labels) > 32:
+                return None
+        if off + 4 > len(data):
+            return None
+        qtype, _qclass = _st.unpack("!HH", data[off:off + 4])
+        if not labels:
+            return None
+        return (qid, labels, qtype)
+    except Exception:
+        return None
+
+
+def _servfail(qid, labels=None, qtype=1):
+    import struct as _st
+    flags = 0x8182
+    if labels:
+        q = _encode_qname(labels) + _st.pack("!HH", qtype, 1)
+        h = _st.pack("!HHHHHH", qid, flags, 1, 0, 0, 0)
+        return h + q
+    return _st.pack("!HHHHHH", qid, flags, 0, 0, 0, 0)
+
+
+def build_response(qid, qname_labels, qtype, ip, ttl):
+    import struct as _st
+    q = _encode_qname(qname_labels) + _st.pack("!HH", qtype, 1)
+    h = _st.pack("!HHHHHH", qid, 0x8180, 1, 1, 0, 0)
+    try:
+        raw = socket.inet_aton(ip)
+    except Exception:
+        return _servfail(qid, qname_labels, qtype)
+    ans = _st.pack("!HHHIH4s", 0xC00C, 1, 1, int(ttl), 4, raw)
+    return h + q + ans
+
+
+class WildcardDnsProxy:
+    """Local DNS proxy: wildcard *.roblox.com/*.rbxcdn.com via DoH.
+
+    Answers Roblox-family A queries from DoH (fresh each time, so CDN
+    rotation can never go stale) and injects a /32 tunnel route per
+    answer. Everything else is forwarded to 8.8.8.8 untouched.
+    Runs as a daemon thread; stop() on disconnect.
+    """
+    SUFFIXES = ('.roblox.com', '.rbxcdn.com', '.robloxlabs.com',
+                '.arkoselabs.com')
+    TTL = 120
+
+    def __init__(self, doh_resolver, route_inject, log):
+        self.doh_resolver = doh_resolver
+        self.route_inject = route_inject
+        self._log = log if callable(log) else (lambda m: None)
+        self.cache = {}
+        self.lock = threading.Lock()
+        self.running = False
+        self._stop = threading.Event()
+        self._thread = None
+        self._sock = None
+
+    def start(self):
+        if self.running:
+            return
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 53))
+            s.settimeout(0.5)
+        except Exception as e:  # noqa: BLE001 -- port busy: caller falls back
+            try:
+                self._log("dns bind 127.0.0.1:53 failed: %r" % (e,))
+            except Exception:
+                pass
+            self.running = False
+            return
+        self._sock = s
+        self._stop.clear()
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self.running = False
+        s, self._sock = self._sock, None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _loop(self):
+        s = self._sock
+        while not self._stop.is_set():
+            try:
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception:
+                if self._stop.is_set():
+                    break
+                continue
+            try:
+                self._handle(data, addr)
+            except Exception:
+                continue
+
+    def _reply(self, payload, addr):
+        try:
+            self._sock.sendto(payload, addr)
+        except Exception:
+            pass
+
+    def _handle(self, data, addr):
+        parsed = parse_query(data)
+        if parsed is None:
+            qid = 0
+            try:
+                if data and len(data) >= 2:
+                    import struct as _st
+                    qid = _st.unpack("!H", data[:2])[0]
+            except Exception:
+                pass
+            self._reply(_servfail(qid), addr)
+            return
+        qid, labels, qtype = parsed
+        name = ".".join(labels)
+        if qtype == 1 and matches_suffix(name):
+            key = name.lower()
+            now = time.time()
+            ip = None
+            with self.lock:
+                hit = self.cache.get(key)
+                if hit and hit[1] > now:
+                    ip = hit[0]
+                elif hit:
+                    self.cache.pop(key, None)
+            if ip is None:
+                try:
+                    ip = self.doh_resolver(name)
+                except Exception:
+                    ip = None
+                if ip:
+                    with self.lock:
+                        self.cache[key] = (ip, time.time() + self.TTL)
+            if ip:
+                try:
+                    self.route_inject(ip)
+                except Exception:
+                    pass
+                try:
+                    self._reply(build_response(qid, labels, qtype, ip,
+                                               self.TTL), addr)
+                except Exception:
+                    self._reply(_servfail(qid, labels, qtype), addr)
+            else:
+                self._reply(_servfail(qid, labels, qtype), addr)
+            return
+        try:
+            f = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                f.settimeout(5)
+                f.sendto(data, ("8.8.8.8", 53))
+                resp, _ = f.recvfrom(4096)
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            self._reply(resp, addr)
+        except Exception:
+            self._reply(_servfail(qid, labels, qtype), addr)
+
+
+def parse_default_ifindex(text):
+    try:
+        if not text:
+            return None
+        m = re.search(r"\b\d+\b", str(text))
+        return m.group(0) if m else None
+    except Exception:
+        return None
+
+
+def DEFAULT_IFINDEX():
+    try:
+        cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | "
+            "Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty InterfaceIndex",
+        ]
+        ok, out = _run(cmd, 15)
+        if not ok or not out:
+            return None
+        return parse_default_ifindex(str(out).strip())
+    except Exception as e:  # noqa: BLE001
+        try:
+            _stealth_log("ifindex failed: %s" % e)
+        except Exception:
+            pass
+        return None
+
+
+def parse_dns_servers(text):
+    try:
+        if not text:
+            return []
+        return re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", str(text))
+    except Exception:
+        return []
+
+
+def get_dns_servers(ifindex):
+    try:
+        idx = str(int(str(ifindex).strip()))
+        cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Get-DnsClientServerAddress -InterfaceIndex %s -AddressFamily IPv4 | "
+            "Select-Object -ExpandProperty ServerAddresses" % idx,
+        ]
+        ok, out = _run(cmd, 15)
+        if not ok or not out:
+            return []
+        return parse_dns_servers(out)
+    except Exception as e:  # noqa: BLE001
+        try:
+            _stealth_log("get_dns failed: %s" % e)
+        except Exception:
+            pass
+        return []
+
+
+def set_dns(ifindex, servers):
+    try:
+        idx = str(int(str(ifindex).strip()))
+        joined = "','".join([s.strip() for s in (servers or [])
+                             if s and str(s).strip()])
+        if not joined:
+            return False
+        cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Set-DnsClientServerAddress -InterfaceIndex %s -ServerAddresses ('%s')" % (idx, joined),
+        ]
+        ok, _ = _run(cmd, 15)
+        try:
+            _stealth_log("set_dns if=%s ok=%s" % (idx, ok))
+        except Exception:
+            pass
+        return bool(ok)
+    except Exception as e:  # noqa: BLE001
+        try:
+            _stealth_log("set_dns failed: %s" % e)
+        except Exception:
+            pass
+        return False
+
+
+def reset_dns(ifindex):
+    try:
+        idx = str(int(str(ifindex).strip()))
+        cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Set-DnsClientServerAddress -InterfaceIndex %s -ResetServerAddresses" % idx,
+        ]
+        ok, _ = _run(cmd, 15)
+        try:
+            _stealth_log("reset_dns if=%s ok=%s" % (idx, ok))
+        except Exception:
+            pass
+        return bool(ok)
+    except Exception as e:  # noqa: BLE001
+        try:
+            _stealth_log("reset_dns failed: %s" % e)
+        except Exception:
+            pass
+        return False
+
+
+def save_original(path, servers):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"servers": list(servers or [])}, f)
+        return True
+    except Exception as e:  # noqa: BLE001
+        try:
+            _stealth_log("save_original failed: %s" % e)
+        except Exception:
+            pass
+        return False
+
+
+def load_original(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        servers = data.get("servers") if isinstance(data, dict) else None
+        if not isinstance(servers, list):
+            return None
+        return [str(s) for s in servers if s]
+    except Exception as e:  # noqa: BLE001
+        try:
+            _stealth_log("load_original failed: %s" % e)
+        except Exception:
+            pass
+        return None
+
+
+def crash_residue_check(current):
+    try:
+        return list(current or []) == ["127.0.0.1"]
+    except Exception:
+        return False
+
+
+def _temp_conf_allow_all(conf_path):
+    """Write a temp conf with AllowedIPs=0.0.0.0/0. Returns path or None.
+
+    The wildcard DNS proxy + per-IP Windows routes enforce split-tunnel
+    dynamically; the engine just accepts everything the (trusted) peer
+    sends. Temp file holds key material: deleted on disconnect.
+    """
+    try:
+        with open(conf_path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    new_text, n = re.subn(r"(?im)^\s*AllowedIPs\s*=.*$",
+                           "AllowedIPs = 0.0.0.0/0", text, count=1)
+    if not n:
+        return None
+    try:
+        tmp = os.path.join(app_dir(), "stealth-tunnel.conf")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        return tmp
+    except OSError as e:
+        _stealth_log("temp conf write failed: %s" % e)
+        return None
+
+
 def _tun_if_index(ifname):
     """Windows interface index for a TUN adapter name (via netsh)."""
     ok, out = _run(["netsh", "interface", "ipv4", "show", "interfaces"])
@@ -1095,6 +1475,9 @@ class StealthBackend:
         self._dns_entries = []
         self._extra_ips = []
         self._tmp_conf = None
+        self._dns_proxy = None
+        self._dns_ifindex = None
+        self._tun_if_idx = None
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -1193,7 +1576,9 @@ class StealthBackend:
             os.unlink(os.path.join(app_dir(), "stealth-tunnel.conf"))
         except OSError:
             pass
-        self._tmp_conf = _extend_conf_for_extra_ips(conf, self._extra_ips)
+        # Engine accepts everything (0.0.0.0/0); Windows routes + the DNS
+        # proxy enforce split-tunnel dynamically per resolved IP.
+        self._tmp_conf = _temp_conf_allow_all(conf)
         # wintun.dll must sit next to the exe
         dll = _stealth_bin(WINTUN_DLL)
         exe_dir = os.path.dirname(self._exe)
@@ -1297,6 +1682,7 @@ class StealthBackend:
             self.disconnect()
             raise TunnelError("could not find tunnel interface "
                               "(%s) -- aborting" % self._ifname)
+        self._tun_if_idx = if_idx
         for net4 in ROBLOX_ALLOWED_IPS:
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
@@ -1361,6 +1747,63 @@ class StealthBackend:
         _stealth_log("=== connect() done ===")
         if start_monitor:
             self._start_monitor()
+        self._start_dns_proxy()
+
+    def _proxy_route(self, ip):
+        """Route one proxy-resolved IP via the tunnel. Never raises."""
+        idx = getattr(self, "_tun_if_idx", None)
+        if not idx or not ip or os.name != "nt":
+            return
+        _run(["route", "delete", ip, "mask", "255.255.255.255"],
+             timeout=10)
+        ok, out = _run(["route", "add", ip, "mask", "255.255.255.255",
+                        self._if_ip, "IF", idx], timeout=10)
+        _stealth_log("proxy route %s: ok=%s" % (ip, ok))
+
+    def _start_dns_proxy(self):
+        """Wildcard *.roblox.com/*.rbxcdn.com DNS via local proxy."""
+        if os.name != "nt":
+            return
+        default_if = DEFAULT_IFINDEX()
+        if not default_if:
+            _stealth_log("dns proxy: no default interface, skipped")
+            return
+        cur = get_dns_servers(default_if)
+        if crash_residue_check(cur):
+            _stealth_log("dns proxy: stale 127.0.0.1 found, resetting")
+            reset_dns(default_if)
+            cur = get_dns_servers(default_if)
+        save_original(os.path.join(app_dir(), "dns-orig.json"), cur)
+        self._dns_proxy = WildcardDnsProxy(_doh_resolve, self._proxy_route,
+                                           _stealth_log)
+        self._dns_proxy.start()
+        if not self._dns_proxy.running:
+            self._dns_proxy = None
+            return
+        if set_dns(default_if, ["127.0.0.1"]):
+            self._dns_ifindex = default_if
+            _run(["ipconfig", "/flushdns"], timeout=15)
+            _stealth_log("dns proxy: system DNS -> 127.0.0.1")
+        else:
+            self._dns_proxy.stop()
+            self._dns_proxy = None
+
+    def _stop_dns_proxy(self):
+        if self._dns_proxy:
+            try:
+                self._dns_proxy.stop()
+            except Exception:
+                pass
+            self._dns_proxy = None
+        if getattr(self, "_dns_ifindex", None):
+            idx, self._dns_ifindex = self._dns_ifindex, None
+            orig = load_original(os.path.join(app_dir(), "dns-orig.json"))
+            if orig:
+                set_dns(idx, orig)
+            else:
+                reset_dns(idx)
+            _run(["ipconfig", "/flushdns"], timeout=15)
+            _stealth_log("dns restored")
 
     def _start_monitor(self):
         """Background health watch: auto-reconnect a stalled tunnel.
@@ -1441,6 +1884,7 @@ class StealthBackend:
     def disconnect(self, stop_monitor=True):
         if stop_monitor:
             self._stop_monitor()
+        self._stop_dns_proxy()
         _hosts_remove()
         try:
             _run(["ipconfig", "/flushdns"], timeout=15)
@@ -2739,7 +3183,34 @@ def run_self_tests():
               "%d hosts" % len(ROBLOX_HOSTS))
     except Exception as e:  # noqa: BLE001
         check("hosts list valid", False, repr(e))
+    # v39: wildcard DNS proxy pure logic (no network in tests).
+    check("suffix match sub", matches_suffix("tr.rbxcdn.com") is True)
+    check("suffix match bare", matches_suffix("roblox.com") is True)
+    check("suffix reject", matches_suffix("google.com") is False)
+    check("suffix reject evil",
+          matches_suffix("roblox.com.evil.com") is False)
+    try:
+        import struct as _st
+        _pkt = (_st.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+                + b"\x02tr\x06rbxcdn\x03com\x00" + _st.pack("!HH", 1, 1))
+        _parsed = parse_query(_pkt)
+        _ok = (_parsed is not None and _parsed[0] == 0x1234
+               and _parsed[1] == ["tr", "rbxcdn", "com"]
+               and _parsed[2] == 1)
+        _resp = build_response(0x1234, ["tr", "rbxcdn", "com"], 1,
+                               "1.2.3.4", 120) if _ok else b""
+        check("dns packet roundtrip",
+              bool(_ok) and b"\x01\x02\x03\x04" in _resp)
+        check("dns parse garbage", parse_query(b"\x00\x01") is None)
+    except Exception as e:  # noqa: BLE001
+        check("dns packet roundtrip", False, repr(e))
     # v35: CDN extension helpers -- range check + temp conf rewrite.
+    check("ifindex parse", parse_default_ifindex("  14\r\n") == "14")
+    check("dns servers parse",
+          parse_dns_servers("a 8.8.8.8 b") == ["8.8.8.8"])
+    check("crash residue",
+          crash_residue_check(["127.0.0.1"]) is True
+          and crash_residue_check(["8.8.8.8"]) is False)
     check("ip in range /17", _ip_in_roblox_range("128.116.44.3") is True)
     check("ip out of range", _ip_in_roblox_range("16.15.1.2") is False)
     check("ip garbage safe", _ip_in_roblox_range("nope") is False)
