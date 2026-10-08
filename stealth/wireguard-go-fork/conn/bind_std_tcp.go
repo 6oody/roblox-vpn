@@ -66,7 +66,9 @@ type StdNetBindTcp struct {
 	errorChan     chan<- error
 	// UnixNano of the last successful readNextPacket; used to detect a
 	// DPI blackhole (open conn, zero progress) and re-dial fresh.
-	lastRx             atomic.Int64
+	lastRx atomic.Int64
+	// UnixNano of the last re-dial (rate-limit, see resetConn).
+	lastRedial         atomic.Int64
 	protectSocket      func(fd int) int
 	serverNameStrategy server_name_utils.ServerNameStrategy
 
@@ -234,9 +236,13 @@ func (bind *StdNetBindTcp) getConnInternal() (net.Conn, error) {
 	addr := bind.endpoint.DstToString()
 	// Blackhole reset: stalled-but-open conn (no error, no rx) -> drop it
 	// here under mu so both Send and recv paths re-dial fresh below.
-	if (bind.tls != nil || bind.tcp != nil) && bind.stalledLocked() {
+	// Rate-limited (see resetConn): without this every Send/recv attempt
+	// during a stall would start a new TLS handshake.
+	if (bind.tls != nil || bind.tcp != nil) && bind.stalledLocked() &&
+		time.Now().UnixNano()-bind.lastRedial.Load() > int64(10*time.Second) {
 		bind.log.Errorf("TCP/TLS stalled %.0fs without rx, re-dialing %s",
 			time.Since(time.Unix(0, bind.lastRx.Load())).Seconds(), addr)
+		bind.lastRedial.Store(time.Now().UnixNano())
 		_ = bind.closeInternal()
 	}
 	if bind.tcp == nil {
@@ -261,12 +267,18 @@ func (bind *StdNetBindTcp) getConnInternal() (net.Conn, error) {
 // resetConn closes and nils the current conn so the next getConn
 // re-dials. Call only when bind.mu is NOT held (Send/recv error paths);
 // getConnInternal does its own reset inline while holding mu.
+// Re-dials are rate-limited: at most one every 10s, so a dead server
+// doesn't turn into a handshake hammer (looks abusive + spams logs).
 func (bind *StdNetBindTcp) resetConn() {
+	if now := time.Now().UnixNano(); now-bind.lastRedial.Load() < int64(10*time.Second) {
+		return
+	}
 	bind.mu.Lock()
 	defer bind.mu.Unlock()
 	if bind.closed {
 		return
 	}
+	bind.lastRedial.Store(time.Now().UnixNano())
 	_ = bind.closeInternal()
 }
 

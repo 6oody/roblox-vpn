@@ -149,6 +149,11 @@ func (tun *NativeTun) ForceMTU(mtu int) {
 // session receives nothing).
 var tunReadTotal atomic.Int64
 
+// TunReadTotal reports total packets delivered to this session.
+func TunReadTotal() int64 {
+	return tunReadTotal.Load()
+}
+
 func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 	tun.running.Add(1)
 	defer tun.running.Done()

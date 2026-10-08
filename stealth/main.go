@@ -348,8 +348,8 @@ func main() {
 			emit(StatusLine{Type: "error", Message: "bind error: " + err.Error()})
 		case <-dropTicker.C:
 			d := wgDev.TunDropCounts()
-			fmt.Fprintf(os.Stderr, "[stealth][tun-drops] invalid_size=%d unknown_version=%d no_route=%d unexpected_src=%d peer_not_running=%d\n",
-				d.InvalidSize, d.UnknownVersion, d.NoRoute, d.UnexpectedSrc, d.PeerNotRunning)
+			fmt.Fprintf(os.Stderr, "[stealth][tun-drops] invalid_size=%d unknown_version=%d no_route=%d unexpected_src=%d peer_not_running=%d tun_read_total=%d\n",
+				d.InvalidSize, d.UnknownVersion, d.NoRoute, d.UnexpectedSrc, d.PeerNotRunning, tun.TunReadTotal())
 			os.Stderr.Sync()
 		case <-ticker.C:
 			rx, tx, hs := peerStats(wgDev)
