@@ -240,7 +240,7 @@ func main() {
 		Errorf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[stealth] "+format+"\n", args...) },
 	}
 	protectSocket := func(fd int) int { return 0 } // no-op: split-tunnel avoids routing loop
-	bind := conn.CreateStdNetBind("tls", server_name_utils.ServerNameTop, connLogger, errChan, protectSocket)
+	bind := conn.CreateStdNetBind("tls", server_name_utils.ServerNameRandomList, connLogger, errChan, protectSocket)
 	tunLog("AFTER CreateStdNetBind")
 
 	// Drain socket errors from the START, not after "ready": dial failures

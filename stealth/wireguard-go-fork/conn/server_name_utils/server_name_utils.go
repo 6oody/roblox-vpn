@@ -31,6 +31,10 @@ type ServerNameStrategy int
 const (
 	ServerNameRandom ServerNameStrategy = iota
 	ServerNameTop
+	// ServerNameRandomList picks a fresh real decoy from the domains
+	// list on every call, so consecutive connections (and re-dials)
+	// present different SNIs instead of one static fingerprint.
+	ServerNameRandomList
 )
 
 var topLevelDomains = []string{"com", "net", "org", "it", "fr", "me", "ru", "cn", "es", "tr", "top", "xyz", "info"}
@@ -147,6 +151,8 @@ func ServerNameFor(strategy ServerNameStrategy, addr string) string {
 	switch strategy {
 	case ServerNameTop:
 		return serverNameForAddr(addr)
+	case ServerNameRandomList:
+		return randItem(domains)
 	case ServerNameRandom:
 		return randomServerName()
 	default:
