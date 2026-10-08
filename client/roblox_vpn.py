@@ -24,6 +24,7 @@ import platform
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v29"
+APP_VERSION = "v31"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -824,6 +825,76 @@ def _conf_address(conf):
     return m.group(1) if m else None
 
 
+HOSTS_TAG = "# RobloxVPN"
+
+
+def _hosts_path():
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.join(sysroot, "System32", "drivers", "etc", "hosts")
+
+
+def _doh_resolve(host, timeout=5):
+    """Resolve an A record via DNS-over-HTTPS (plain DNS is DPI-poisoned).
+
+    Direct HTTPS to 1.1.1.1/8.8.8.8 works where port-53 DNS fails.
+    Returns the IPv4 string or None. Never raises.
+    """
+    queries = ("https://1.1.1.1/dns-query?name=%s&type=A" % host,
+               "https://8.8.8.8/resolve?name=%s&type=A" % host)
+    for url in queries:
+        try:
+            req = urllib.request.Request(
+                url, headers={"accept": "application/dns-json"})
+            d = json.load(urllib.request.urlopen(req, timeout=timeout))
+            for a in d.get("Answer", []):
+                if a.get("type") == 1 and re.match(
+                        r"^\d+\.\d+\.\d+\.\d+$", a.get("data", "")):
+                    return a["data"]
+        except Exception:
+            continue
+    return None
+
+
+def _hosts_add(entries, path=None):
+    """Append '{ip} {host} # RobloxVPN' lines. Returns count. Never raises."""
+    if os.name != "nt" or not entries:
+        return 0
+    path = path or _hosts_path()
+    try:
+        _hosts_remove(path=path)  # drop stale lines first (self-healing)
+        with open(path, "a", encoding="utf-8") as f:
+            for ip, host in entries:
+                f.write("%s %s %s\n" % (ip, host, HOSTS_TAG))
+        _stealth_log("hosts file: added %d entries" % len(entries))
+        return len(entries)
+    except OSError as e:
+        _stealth_log("hosts file add failed: %s" % e)
+        return 0
+
+
+def _hosts_remove(path=None):
+    """Remove our tagged lines. Returns count removed. Never raises."""
+    if os.name != "nt":
+        return 0
+    path = path or _hosts_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return 0
+    kept = [l for l in lines if HOSTS_TAG not in l]
+    removed = len(lines) - len(kept)
+    if not removed:
+        return 0
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+    except OSError as e:
+        _stealth_log("hosts file remove failed: %s" % e)
+        return 0
+    return removed
+
+
 def _tun_if_index(ifname):
     """Windows interface index for a TUN adapter name (via netsh)."""
     ok, out = _run(["netsh", "interface", "ipv4", "show", "interfaces"])
@@ -880,11 +951,18 @@ class StealthBackend:
 
     def _read_loop(self):
         try:
+            dropped = 0
             for line in self.proc.stdout:
                 if self._stop_reader.is_set():
                     break
                 line = line.strip()
                 if not line.startswith("{"):
+                    # The engine logs errors (e.g. wg data-path failures)
+                    # as non-JSON lines -- they used to vanish silently.
+                    # Keep the first few so the debug log shows them.
+                    if line and dropped < 10:
+                        _stealth_log("engine-log: %s" % line[:200])
+                    dropped += 1
                     continue
                 try:
                     d = json.loads(line)
@@ -1011,6 +1089,14 @@ class StealthBackend:
         if not ok:
             self.disconnect()
             raise TunnelError("could not set tunnel IP:\n" + out.strip())
+        # Clamp the TUN MTU for double-TLS overhead: Windows sizes TCP
+        # segments from the adapter MTU, and full-size segments would
+        # blackhole inside the Stealth tunnel (TLS-in-TLS). 1280 is safe
+        # and keeps IPv6 minimum-MTU happy too. Never raises loudly --
+        # a fixed route matters more than MTU, so warn and continue.
+        ok, out = _run(["netsh", "interface", "ipv4", "set", "subinterface",
+                        self._ifname, "mtu=1280", "store=active"])
+        _stealth_log_cmd("set MTU 1280", ok, out)
         # Roblox-only route via the tunnel -- bound to the TUN interface
         # explicitly (IF <index>): without IF, Windows silently binds the
         # route to the physical NIC (the /32 TUN address is not recognized
@@ -1049,9 +1135,47 @@ class StealthBackend:
             self.disconnect()
             raise TunnelError("Roblox route is not using the tunnel "
                               "(via %s) -- aborting" % out.strip()[:80])
+        # --- DNS via hosts file: plain-DNS for Roblox is DPI-poisoned,
+        # so resolve over HTTPS and pin results locally. Tagged lines are
+        # removed on disconnect (self-healing if a run dies).
+        entries = []
+        for host in ROBLOX_HOSTS:
+            ip = _doh_resolve(host)
+            _stealth_log("DoH %s -> %s" % (host, ip))
+            if ip:
+                entries.append((ip, host))
+        if entries:
+            _hosts_add(entries)
+            ok, out = _run(["ipconfig", "/flushdns"], timeout=15)
+            _stealth_log("flushdns: ok=%s" % ok)
+            # The DNS Client picks up hosts-file changes asynchronously;
+            # without this pause+verify, the first lookups still fail.
+            time.sleep(3)
+            for _try in range(2):
+                missing = []
+                for ip, host in entries:
+                    try:
+                        got = socket.getaddrinfo(
+                            host, 443, socket.AF_INET)[0][4][0]
+                    except OSError:
+                        got = None
+                    if got != ip:
+                        missing.append(host)
+                _stealth_log("hosts verify: %s" %
+                             ("all ok" if not missing else missing))
+                if not missing:
+                    break
+                time.sleep(3)
+        else:
+            _stealth_log("DoH resolved nothing; browser DNS may still fail")
         _stealth_log("=== connect() done ===")
 
     def disconnect(self):
+        _hosts_remove()
+        try:
+            _run(["ipconfig", "/flushdns"], timeout=15)
+        except Exception:
+            pass
         for net4 in ROBLOX_ALLOWED_IPS:
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
@@ -2304,6 +2428,29 @@ def run_self_tests():
         check("stealth cleanup helpers safe", True)
     except Exception as e:  # noqa: BLE001
         check("stealth cleanup helpers safe", False, repr(e))
+    # v31: hosts-file DNS bypass (plain DNS for Roblox is DPI-poisoned).
+    # add/remove roundtrip on a temp file; other lines must survive.
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False,
+                                         encoding="utf-8") as f:
+            f.write("127.0.0.1 localhost\n")
+            tmp3 = f.name
+        try:
+            ok_add = _hosts_add([("1.2.3.4", "www.roblox.com")], path=tmp3)
+            with open(tmp3, encoding="utf-8") as f:
+                body = f.read()
+            ok_keep = "127.0.0.1 localhost" in body
+            ok_tag = "1.2.3.4 www.roblox.com" in body
+            n_rm = _hosts_remove(path=tmp3)
+            with open(tmp3, encoding="utf-8") as f:
+                gone = HOSTS_TAG not in f.read()
+            check("hosts add/remove roundtrip",
+                  ok_add == 1 and ok_keep and ok_tag
+                  and n_rm == 1 and gone)
+        finally:
+            os.unlink(tmp3)
+    except Exception as e:  # noqa: BLE001
+        check("hosts add/remove roundtrip", False, repr(e))
     # v27: Roblox route must be bound to the TUN via IF <index>;
     # resolving an unknown interface must safely return None
     try:

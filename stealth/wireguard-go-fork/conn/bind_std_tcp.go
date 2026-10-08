@@ -143,6 +143,10 @@ func (bind *StdNetBindTcp) upgradeToTls(addr string) error {
 	err := conn.Handshake()
 	bind.log.Verbosef("TLS: Handshake result: %v", err)
 	conn.SetDeadline(time.Time{})
+	// Rotate the ClientHello on EVERY handshake (not just errors): reusing
+	// the identical fingerprint on every re-dial lets DPI profile and
+	// throttle repeat connections after the first grace window.
+	nextHelloIdx.Store((nextHelloIdx.Load() + 1) % int32(len(hellos)))
 
 	// On some devices (e.g. Samsung S21 FE) we see first WireGuard handshake failing on TLS socket and adding small
 	// delay seems to fix that - issue is likely with timing on the server side, but couldn't find server-side fix.
@@ -341,9 +345,13 @@ func (bind *StdNetBindTcp) Send(buff []byte, endpoint Endpoint) error {
 	}
 
 	// As single tcp socket can send only to single destination. We assume endpoint passed to ParseEndpoint will be
-	// the same.
-	boundEndpoint := asEndpoint((netip.AddrPort)(*bind.endpoint))
-	if endpoint != boundEndpoint {
+	// the same. Compare by destination string (not interface equality):
+	// after the first received packet the device stores the *pointer*
+	// bind.endpoint via SetEndpointFromPacket while boundEndpoint below
+	// is a value -- always unequal, which permanently rejects EVERY send
+	// (handshake re-tries and data alike) with "endpoints mismatch".
+	if endpoint == nil || bind.endpoint == nil ||
+		endpoint.DstToString() != bind.endpoint.DstToString() {
 		return errors.New("StdNetBindTcp.Send endpoints mismatch")
 	}
 

@@ -169,19 +169,21 @@ retry:
 			copy(buff[offset:], packet)
 			tun.session.ReleaseReceivePacket(packet)
 			tun.rate.update(uint64(packetSize))
-			if c := tunReadTotal.Add(1); c <= 5 || c%100 == 0 {
-				ver, dst := "?", ""
-				if len(packet) > 0 {
-					switch packet[0] >> 4 {
-					case 4:
-						ver = "v4"
-						if len(packet) >= 20 {
-							dst = fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
-						}
-					case 6:
-						ver = "v6"
+			ver, dst := "?", ""
+			if len(packet) > 0 {
+				switch packet[0] >> 4 {
+				case 4:
+					ver = "v4"
+					if len(packet) >= 20 {
+						dst = fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
 					}
+				case 6:
+					ver = "v6"
 				}
+			}
+			// Log first 5 + every 100th (diagnostic; throttled to avoid
+			// disk churn under game traffic).
+			if c := tunReadTotal.Add(1); c <= 5 || c%100 == 0 {
 				fmt.Fprintf(os.Stderr, "[stealth][tunread] #%d %s dst=%s len=%d\n", c, ver, dst, packetSize)
 				os.Stderr.Sync()
 			}
