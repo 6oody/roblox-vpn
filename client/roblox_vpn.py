@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v33"
+APP_VERSION = "v34"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -918,6 +918,19 @@ def _stealth_log(msg):
         pass
 
 
+STALL_WINDOW = 25       # sec of tx-without-rx before auto-reconnect
+STALL_MAX_RECONNECTS = 5  # per connect() call; then stay on last tunnel
+NO_READY_TIMEOUT = 90   # sec without ready/status before auto-reconnect
+
+
+def _rx_stalled(rx0, tx0, rx1, tx1):
+    """Pure stall test: we sent more but got nothing new back."""
+    try:
+        return tx1 > tx0 and rx1 == rx0
+    except TypeError:
+        return False
+
+
 class StealthBackend:
     """Drives stealth-wg.exe (Go, Proton Stealth transport) as a child process.
 
@@ -938,6 +951,10 @@ class StealthBackend:
         self._connect_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._saw_ready = False
+        self._conf = None
+        self._monitor = None
+        self._monitor_stop = threading.Event()
+        self._reconnects = 0
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -987,12 +1004,14 @@ class StealthBackend:
         finally:
             self._connect_lock.release()
 
-    def _connect_inner(self, conf):
+    def _connect_inner(self, conf, start_monitor=True):
         ok, msg = self.available()
         _stealth_log("available: %s %s" % (ok, msg))
         if not ok:
             raise TunnelError(msg)
-        self.disconnect()  # clean slate
+        self._conf = conf
+        self._reconnects = 0
+        self.disconnect(stop_monitor=False)  # clean slate
         # never run two engines at once -- concurrent WintunCreateAdapter
         # calls wedge the driver
         _kill_stale_stealth()
@@ -1169,8 +1188,88 @@ class StealthBackend:
         else:
             _stealth_log("DoH resolved nothing; browser DNS may still fail")
         _stealth_log("=== connect() done ===")
+        if start_monitor:
+            self._start_monitor()
 
-    def disconnect(self):
+    def _start_monitor(self):
+        """Background health watch: auto-reconnect a stalled tunnel.
+
+        Stall = tx grew but rx didn't for STALL_WINDOW (traffic blackholed),
+        or no ready/status at all for NO_READY_TIMEOUT. Each reconnect is a
+        fresh engine + adapter + session. Capped per connect() call.
+        """
+        self._stop_monitor()
+        self._monitor_stop.clear()
+        self._monitor = threading.Thread(target=self._monitor_loop,
+                                         daemon=True)
+        self._monitor.start()
+
+    def _stop_monitor(self):
+        self._monitor_stop.set()
+        m, self._monitor = self._monitor, None
+        if m and m is not threading.current_thread():
+            m.join(timeout=8)
+
+    def _monitor_loop(self):
+        last_rx = last_tx = None
+        stalled_since = None
+        start = time.time()
+        while not self._monitor_stop.is_set():
+            time.sleep(5)
+            if self._monitor_stop.is_set():
+                break
+            with self._state_lock:
+                d = dict(self._latest)
+                saw = self._saw_ready
+            if d.get("type") in ("status", "ready") or saw:
+                rx = int(d.get("rx_bytes", 0) or 0)
+                tx = int(d.get("tx_bytes", 0) or 0)
+                if last_rx is None:
+                    last_rx, last_tx = rx, tx
+                    stalled_since = None
+                elif _rx_stalled(last_rx, last_tx, rx, tx):
+                    if stalled_since is None:
+                        stalled_since = time.time()
+                    elif time.time() - stalled_since >= STALL_WINDOW:
+                        self._auto_reconnect("no rx progress for %ds "
+                                             "(tx %d->%d)" % (STALL_WINDOW,
+                                                              last_tx, tx))
+                        last_rx, last_tx, stalled_since = None, None, None
+                        start = time.time()
+                        continue
+                else:
+                    last_rx, last_tx = rx, tx
+                    stalled_since = None
+            elif time.time() - start >= NO_READY_TIMEOUT:
+                self._auto_reconnect("no engine status for %ds" %
+                                     NO_READY_TIMEOUT)
+                last_rx, last_tx, stalled_since = None, None, None
+                start = time.time()
+
+    def _auto_reconnect(self, why):
+        if self._reconnects >= STALL_MAX_RECONNECTS:
+            _stealth_log("auto-reconnect cap reached; staying put")
+            return
+        if not self._connect_lock.acquire(blocking=False):
+            return
+        try:
+            self._reconnects += 1
+            _stealth_log("auto-reconnect #%d: %s"
+                         % (self._reconnects, why))
+            conf = self._conf
+            self.disconnect(stop_monitor=False)
+            if conf:
+                try:
+                    self._connect_inner(conf, start_monitor=False)
+                except TunnelError as e:
+                    _stealth_log("auto-reconnect failed: %s"
+                                 % str(e)[:150])
+        finally:
+            self._connect_lock.release()
+
+    def disconnect(self, stop_monitor=True):
+        if stop_monitor:
+            self._stop_monitor()
         _hosts_remove()
         try:
             _run(["ipconfig", "/flushdns"], timeout=15)
@@ -2451,6 +2550,16 @@ def run_self_tests():
             os.unlink(tmp3)
     except Exception as e:  # noqa: BLE001
         check("hosts add/remove roundtrip", False, repr(e))
+    # v34: stall verdict is pure and tested; monitor hooks into connect.
+    check("rx_stalled true", _rx_stalled(100, 50, 100, 80) is True)
+    check("rx_stalled idle", _rx_stalled(100, 50, 100, 50) is False)
+    check("rx_stalled progress", _rx_stalled(100, 50, 150, 80) is False)
+    if _src is None:
+        check("monitor hooks connect (skipped frozen)", True)
+    else:
+        check("monitor hooks connect",
+              "_start_monitor()" in _src
+              and hasattr(StealthBackend, "_monitor_loop"))
     # v27: Roblox route must be bound to the TUN via IF <index>;
     # resolving an unknown interface must safely return None
     try:
