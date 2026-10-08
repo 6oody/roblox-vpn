@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v34"
+APP_VERSION = "v35"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -895,6 +895,48 @@ def _hosts_remove(path=None):
     return removed
 
 
+def _ip_in_roblox_range(ip):
+    """True if ip is inside ROBLOX_ALLOWED_IPS. Never raises."""
+    try:
+        import ipaddress as _ipmod
+        addr = _ipmod.ip_address(ip)
+        return any(addr in _ipmod.ip_network(n) for n in ROBLOX_ALLOWED_IPS)
+    except ValueError:
+        return False
+
+
+def _extend_conf_for_extra_ips(conf_path, extra_ips):
+    """Write a temp conf with extended AllowedIPs. Returns path or None.
+
+    CDN hosts (setup.*) resolve outside 128.116.0.0/17; without extending
+    both the Windows route and the engine's cryptokey routing, the
+    launcher bootstrap goes direct and dies. The temp file holds key
+    material: deleted on disconnect.
+    """
+    if not extra_ips:
+        return None
+    try:
+        with open(conf_path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    extra = ",".join("%s/32" % ip for ip in sorted(set(extra_ips)))
+    new_text, n = re.subn(r"(?im)^(\s*AllowedIPs\s*=\s*)(.+)$",
+                           lambda m: m.group(1) + m.group(2).rstrip() +
+                           "," + extra, text, count=1)
+    if not n:
+        return None
+    try:
+        tmp = os.path.join(app_dir(), "stealth-tunnel.conf")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        _stealth_log("temp conf with extra AllowedIPs: %s" % extra)
+        return tmp
+    except OSError as e:
+        _stealth_log("temp conf write failed: %s" % e)
+        return None
+
+
 def _tun_if_index(ifname):
     """Windows interface index for a TUN adapter name (via netsh)."""
     ok, out = _run(["netsh", "interface", "ipv4", "show", "interfaces"])
@@ -955,6 +997,9 @@ class StealthBackend:
         self._monitor = None
         self._monitor_stop = threading.Event()
         self._reconnects = 0
+        self._dns_entries = []
+        self._extra_ips = []
+        self._tmp_conf = None
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -1028,6 +1073,23 @@ class StealthBackend:
         if not ip:
             raise TunnelError("could not read Address from config")
         self._if_ip = ip
+        # --- DNS early: resolve launcher hosts over HTTPS (plain DNS is
+        # DPI-poisoned) so the engine conf (below) and routes can cover
+        # out-of-range CDN IPs too.
+        self._dns_entries = []
+        for host in ROBLOX_HOSTS:
+            rip = _doh_resolve(host)
+            _stealth_log("DoH %s -> %s" % (host, rip))
+            if rip:
+                self._dns_entries.append((rip, host))
+        self._extra_ips = sorted({ip for ip, _ in self._dns_entries
+                                  if not _ip_in_roblox_range(ip)})
+        # remove any stale temp conf, then build a fresh one if needed
+        try:
+            os.unlink(os.path.join(app_dir(), "stealth-tunnel.conf"))
+        except OSError:
+            pass
+        self._tmp_conf = _extend_conf_for_extra_ips(conf, self._extra_ips)
         # wintun.dll must sit next to the exe
         dll = _stealth_bin(WINTUN_DLL)
         exe_dir = os.path.dirname(self._exe)
@@ -1054,7 +1116,7 @@ class StealthBackend:
         _stealth_log("launching stealth-wg.exe ...")
         try:
             self.proc = subprocess.Popen(
-                [self._exe, conf, self._ifname],
+                [self._exe, self._tmp_conf or conf, self._ifname],
                 stdout=subprocess.PIPE, stderr=err_log,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 **_no_window())
@@ -1142,6 +1204,15 @@ class StealthBackend:
             if not ok:
                 self.disconnect()
                 raise TunnelError("could not add Roblox route:\n" + out.strip())
+        # CDN hosts resolve outside 128.116.0.0/17 (AWS/S3): pin each
+        # current IP via the tunnel too, else the launcher bootstrap
+        # goes direct and dies.
+        for cip in self._extra_ips:
+            _run(["route", "delete", cip, "mask", "255.255.255.255"])
+            ok, out = _run(["route", "add", cip, "mask", "255.255.255.255",
+                            ip, "IF", if_idx])
+            _stealth_log_cmd("route add %s/32 IF %s" % (cip, if_idx),
+                             ok, out)
         # verify the route really goes through the tunnel (not the LAN)
         ok, out = _run(["powershell", "-NoProfile", "-Command",
                         "Find-NetRoute -RemoteIPAddress 128.116.13.3 "
@@ -1156,13 +1227,9 @@ class StealthBackend:
                               "(via %s) -- aborting" % out.strip()[:80])
         # --- DNS via hosts file: plain-DNS for Roblox is DPI-poisoned,
         # so resolve over HTTPS and pin results locally. Tagged lines are
-        # removed on disconnect (self-healing if a run dies).
-        entries = []
-        for host in ROBLOX_HOSTS:
-            ip = _doh_resolve(host)
-            _stealth_log("DoH %s -> %s" % (host, ip))
-            if ip:
-                entries.append((ip, host))
+        # removed on disconnect (self-healing if a run dies). Entries were
+        # resolved up-front (also used for CDN routes + engine conf).
+        entries = list(self._dns_entries)
         if entries:
             _hosts_add(entries)
             ok, out = _run(["ipconfig", "/flushdns"], timeout=15)
@@ -1275,6 +1342,15 @@ class StealthBackend:
             _run(["ipconfig", "/flushdns"], timeout=15)
         except Exception:
             pass
+        for cip in list(getattr(self, "_extra_ips", [])):
+            _run(["route", "delete", cip, "mask", "255.255.255.255"])
+        self._extra_ips = []
+        tmp, self._tmp_conf = getattr(self, "_tmp_conf", None), None
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         for net4 in ROBLOX_ALLOWED_IPS:
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
@@ -2550,6 +2626,31 @@ def run_self_tests():
             os.unlink(tmp3)
     except Exception as e:  # noqa: BLE001
         check("hosts add/remove roundtrip", False, repr(e))
+    # v35: CDN extension helpers -- range check + temp conf rewrite.
+    check("ip in range /17", _ip_in_roblox_range("128.116.44.3") is True)
+    check("ip out of range", _ip_in_roblox_range("16.15.1.2") is False)
+    check("ip garbage safe", _ip_in_roblox_range("nope") is False)
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                         delete=False,
+                                         encoding="utf-8") as f:
+            f.write("[Interface]\nPrivateKey = AAAA\nAddress = 10.9.9.9/32\n"
+                    "[Peer]\nPublicKey = BBBB\nEndpoint = 9.9.9.9:51820\n"
+                    "AllowedIPs = 128.116.0.0/17\n")
+            tmpc = f.name
+        try:
+            p = _extend_conf_for_extra_ips(tmpc, ["16.15.1.2"])
+            ok_ext = (p and "16.15.1.2/32" in open(p, encoding="utf-8").read()
+                      and "128.116.0.0/17" in open(p, encoding="utf-8").read())
+            if p:
+                os.unlink(p)
+            check("extend conf extra ips", bool(ok_ext))
+            check("extend conf none==None",
+                  _extend_conf_for_extra_ips(tmpc, []) is None)
+        finally:
+            os.unlink(tmpc)
+    except Exception as e:  # noqa: BLE001
+        check("extend conf extra ips", False, repr(e))
     # v34: stall verdict is pure and tested; monitor hooks into connect.
     check("rx_stalled true", _rx_stalled(100, 50, 100, 80) is True)
     check("rx_stalled idle", _rx_stalled(100, 50, 100, 50) is False)
