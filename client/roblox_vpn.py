@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v37"
+APP_VERSION = "v38"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -47,19 +47,110 @@ SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 ROBLOX_ALLOWED_IPS = ["128.116.0.0/17"]
 
 # Roblox endpoints that must resolve through the tunnel's network path.
-# (Website/API = TCP 443, game servers = UDP 49152-65535; the CDN hosts below
-# are only needed by the launcher and normally work direct, but resolving them
-# here documents the full footprint.)
+# Full footprint (website/API/game/CDN/features). Resolved via DoH at
+# connect time (plain DNS is DPI-poisoned); out-of-range CDN answers get
+# per-IP /32 routes + engine coverage automatically.
 ROBLOX_HOSTS = [
+    # CORE (website / auth / api)
+    "roblox.com",
     "www.roblox.com",
+    "web.roblox.com",
+    "m.roblox.com",
     "api.roblox.com",
+    "apis.roblox.com",
+    "auth.roblox.com",
+    "accountsettings.roblox.com",
+    "accountinformation.roblox.com",
+    # GAME CLIENT (join / settings / updates)
+    "gamejoin.roblox.com",
+    "games.roblox.com",
     "setup.roblox.com",
-    "setup.rbxcdn.com",
     "clientsettings.roblox.com",
     "clientsettingscdn.roblox.com",
-    "auth.roblox.com",
-    "apis.roblox.com",
-    "gamejoin.roblox.com",
+    "assetdelivery.roblox.com",
+    "gamepersistence.roblox.com",
+    "voice.roblox.com",
+    # CDN (rbxcdn.com)
+    "rbxcdn.com",
+    "www.rbxcdn.com",
+    "cdn.rbxcdn.com",
+    "setup.rbxcdn.com",
+    "static.rbxcdn.com",
+    "js.rbxcdn.com",
+    "css.rbxcdn.com",
+    "images.rbxcdn.com",
+    "t0.rbxcdn.com",
+    "t1.rbxcdn.com",
+    "t2.rbxcdn.com",
+    "t3.rbxcdn.com",
+    "t4.rbxcdn.com",
+    "t5.rbxcdn.com",
+    "t6.rbxcdn.com",
+    "t7.rbxcdn.com",
+    "c0.rbxcdn.com",
+    "c1.rbxcdn.com",
+    "c2.rbxcdn.com",
+    "c3.rbxcdn.com",
+    "c4.rbxcdn.com",
+    "c5.rbxcdn.com",
+    "c6.rbxcdn.com",
+    "c7.rbxcdn.com",
+    "sc0gcp.rbxcdn.com",
+    "hls-segments.rbxcdn.com",
+    # FEATURE APIs
+    "avatar.roblox.com",
+    "catalog.roblox.com",
+    "inventory.roblox.com",
+    "users.roblox.com",
+    "friends.roblox.com",
+    "groups.roblox.com",
+    "chat.roblox.com",
+    "presence.roblox.com",
+    "notifications.roblox.com",
+    "economy.roblox.com",
+    "billing.roblox.com",
+    "trades.roblox.com",
+    "badges.roblox.com",
+    "contacts.roblox.com",
+    "follows.roblox.com",
+    "thumbnails.roblox.com",
+    "thumbnailsresizer.roblox.com",
+    "metrics.roblox.com",
+    "abtesting.roblox.com",
+    "ads.roblox.com",
+    "captcha.roblox.com",
+    "abuse.roblox.com",
+    "locale.roblox.com",
+    "translations.roblox.com",
+    "premiumfeatures.roblox.com",
+    "kudos.roblox.com",
+    "points.roblox.com",
+    "events.roblox.com",
+    "publish.roblox.com",
+    "data.roblox.com",
+    "ecsv2.roblox.com",
+    # CREATOR / DEVELOPER
+    "create.roblox.com",
+    "develop.roblox.com",
+    "devforum.roblox.com",
+    # SUPPORT / STATUS / INFO
+    "help.roblox.com",
+    "en.help.roblox.com",
+    "status.roblox.com",
+    "blog.roblox.com",
+    "corp.roblox.com",
+    # ROBLOX CHINA (Tencent)
+    "roblox.qq.com",
+    # OTHER ROBLOX-OWNED
+    "robloxlabs.com",
+    "www.robloxlabs.com",
+    # THIRD-PARTY services the client contacts (Arkose captcha)
+    "roblox-api.arkoselabs.com",
+    # TEST / INTERNAL (staff/test environments)
+    "gametest.roblox.com",
+    "sitetest.roblox.com",
+    "gametest.robloxlabs.com",
+    "sitetest.robloxlabs.com",
 ]
 
 DEFAULT_PORT = 443          # UDP 443 is less conspicuous than 51820
@@ -1079,13 +1170,22 @@ class StealthBackend:
         self._if_ip = ip
         # --- DNS early: resolve launcher hosts over HTTPS (plain DNS is
         # DPI-poisoned) so the engine conf (below) and routes can cover
-        # out-of-range CDN IPs too.
+        # out-of-range CDN IPs too. Resolved in parallel: ~90 hosts would
+        # take minutes sequentially.
+        import concurrent.futures as _fut
         self._dns_entries = []
-        for host in ROBLOX_HOSTS:
-            rip = _doh_resolve(host)
+        try:
+            with _fut.ThreadPoolExecutor(max_workers=16) as _ex:
+                _resolved = list(_ex.map(_doh_resolve, ROBLOX_HOSTS))
+        except Exception as e:  # noqa: BLE001 -- resolve individually
+            _stealth_log("parallel DoH failed, falling back: %r" % e)
+            _resolved = [_doh_resolve(h) for h in ROBLOX_HOSTS]
+        for host, rip in zip(ROBLOX_HOSTS, _resolved):
             _stealth_log("DoH %s -> %s" % (host, rip))
             if rip:
                 self._dns_entries.append((rip, host))
+        _stealth_log("DoH resolved %d/%d hosts"
+                     % (len(self._dns_entries), len(ROBLOX_HOSTS)))
         self._extra_ips = sorted({ip for ip, _ in self._dns_entries
                                   if not _ip_in_roblox_range(ip)})
         # remove any stale temp conf, then build a fresh one if needed
@@ -2630,6 +2730,15 @@ def run_self_tests():
             os.unlink(tmp3)
     except Exception as e:  # noqa: BLE001
         check("hosts add/remove roundtrip", False, repr(e))
+    # v38: full domain footprint -- valid hostnames, no duplicates.
+    try:
+        _bad = [h for h in ROBLOX_HOSTS
+                if not re.match(r"^[a-z0-9][a-z0-9.-]*\.[a-z]+$", h)]
+        check("hosts list valid",
+              not _bad and len(ROBLOX_HOSTS) == len(set(ROBLOX_HOSTS)),
+              "%d hosts" % len(ROBLOX_HOSTS))
+    except Exception as e:  # noqa: BLE001
+        check("hosts list valid", False, repr(e))
     # v35: CDN extension helpers -- range check + temp conf rewrite.
     check("ip in range /17", _ip_in_roblox_range("128.116.44.3") is True)
     check("ip out of range", _ip_in_roblox_range("16.15.1.2") is False)
