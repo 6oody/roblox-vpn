@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v40"
+APP_VERSION = "v42"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -973,6 +973,35 @@ def _hosts_add(entries, path=None):
         return 0
 
 
+def _hosts_sync(entries, path=None):
+    """Rewrite our tagged hosts lines to exactly `entries`. Returns (added, removed).
+
+    Called periodically: CDN answers rotate, so pins go stale within
+    minutes. Never raises. Preserves all untagged lines.
+    """
+    if os.name != "nt":
+        return (0, 0)
+    path = path or _hosts_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return (0, 0)
+    wanted = {"%s %s %s\n" % (ip, host, HOSTS_TAG) for ip, host in entries}
+    kept = [l for l in lines if HOSTS_TAG not in l]
+    have = {l for l in lines if HOSTS_TAG in l}
+    if have == wanted:
+        return (0, 0)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+            f.writelines(sorted(wanted))
+    except OSError as e:
+        _stealth_log("hosts sync failed: %s" % e)
+        return (0, 0)
+    return (len(wanted - have), len(have - wanted))
+
+
 def _hosts_remove(path=None):
     """Remove our tagged lines. Returns count removed. Never raises."""
     if os.name != "nt":
@@ -1204,7 +1233,10 @@ class WildcardDnsProxy:
             return
         qid, labels, qtype = parsed
         name = ".".join(labels)
-        if qtype == 1 and matches_suffix(name):
+        if qtype == 1:
+            # A records: everything via DoH (plain :53 is DPI-poisoned
+            # here). Roblox-family answers additionally get a /32 tunnel
+            # route injected so they actually use the VPN.
             key = name.lower()
             now = time.time()
             ip = None
@@ -1223,10 +1255,11 @@ class WildcardDnsProxy:
                     with self.lock:
                         self.cache[key] = (ip, time.time() + self.TTL)
             if ip:
-                try:
-                    self.route_inject(ip)
-                except Exception:
-                    pass
+                if matches_suffix(name):
+                    try:
+                        self.route_inject(ip)
+                    except Exception:
+                        pass
                 try:
                     self._reply(build_response(qid, labels, qtype, ip,
                                                self.TTL), addr)
@@ -1235,6 +1268,15 @@ class WildcardDnsProxy:
             else:
                 self._reply(_servfail(qid, labels, qtype), addr)
             return
+        if qtype == 28:
+            # AAAA: our tunnel is IPv4-only; answer NODATA so clients
+            # fall back to A (which we serve) instead of broken IPv6.
+            import struct as _st
+            q = _encode_qname(labels) + _st.pack("!HH", qtype, 1)
+            h = _st.pack("!HHHHHH", qid, 0x8180, 1, 0, 0, 0)
+            self._reply(h + q, addr)
+            return
+        # Other types (MX/TXT/SRV...): best-effort forward to public DNS.
         try:
             f = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -1483,6 +1525,8 @@ class StealthBackend:
         self._dns_proxy = None
         self._dns_ifindex = None
         self._tun_if_idx = None
+        self._refresher = None
+        self._dns_stop = threading.Event()
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -1702,6 +1746,9 @@ class StealthBackend:
         # CDN hosts resolve outside 128.116.0.0/17 (AWS/S3): pin each
         # current IP via the tunnel too, else the launcher bootstrap
         # goes direct and dies.
+        # CDN hosts resolve outside 128.116.0.0/17 (AWS/S3): pin each
+        # current IP via the tunnel too, else the launcher bootstrap
+        # goes direct and dies.
         for cip in self._extra_ips:
             _run(["route", "delete", cip, "mask", "255.255.255.255"])
             ok, out = _run(["route", "add", cip, "mask", "255.255.255.255",
@@ -1752,7 +1799,54 @@ class StealthBackend:
         _stealth_log("=== connect() done ===")
         if start_monitor:
             self._start_monitor()
-        self._start_dns_proxy()
+            # NOTE: local :53 proxy retired -- port-53 answers are
+            # intercepted on this box (even loopback). DNS freshness comes
+            # from the refresher (hosts + routes, every 60s).
+            self._dns_stop.clear()
+            self._refresher = threading.Thread(target=self._refresh_loop,
+                                               daemon=True)
+            self._refresher.start()
+
+    def _refresh_loop(self):
+        """Re-resolve all hosts every 60s; sync hosts file + split routes.
+
+        CDN answers rotate constantly; without refresh, pins go stale
+        within minutes and images/videos die. Stops on disconnect.
+        """
+        while not self._dns_stop.is_set():
+            self._dns_stop.wait(60)
+            if self._dns_stop.is_set():
+                break
+            try:
+                if self.proc is None or self.proc.poll() is not None:
+                    break
+                import concurrent.futures as _fut
+                with _fut.ThreadPoolExecutor(max_workers=16) as _ex:
+                    _resolved = list(_ex.map(_doh_resolve, ROBLOX_HOSTS))
+                entries = [(ip, h) for h, ip in zip(ROBLOX_HOSTS, _resolved)
+                           if ip]
+                if not entries:
+                    continue
+                a, r = _hosts_sync(entries)
+                cur_extra = {ip for ip, _ in entries
+                             if not _ip_in_roblox_range(ip)}
+                idx = getattr(self, "_tun_if_idx", None)
+                if idx:
+                    old = set(getattr(self, "_extra_ips", []))
+                    for cip in sorted(cur_extra - old):
+                        _run(["route", "delete", cip, "mask",
+                              "255.255.255.255"], timeout=10)
+                        _run(["route", "add", cip, "mask", "255.255.255.255",
+                              self._if_ip, "IF", idx], timeout=10)
+                    for cip in sorted(old - cur_extra):
+                        _run(["route", "delete", cip, "mask",
+                              "255.255.255.255"], timeout=10)
+                    self._extra_ips = sorted(cur_extra)
+                if a or r:
+                    _stealth_log("dns refresh: +%d -%d hosts" % (a, r))
+                    _run(["ipconfig", "/flushdns"], timeout=15)
+            except Exception as e:  # noqa: BLE001 -- never kill refresher
+                _stealth_log("dns refresh failed: %r" % e)
 
     def _proxy_route(self, ip):
         """Route one proxy-resolved IP via the tunnel. Never raises."""
@@ -1825,6 +1919,10 @@ class StealthBackend:
 
     def _stop_monitor(self):
         self._monitor_stop.set()
+        try:
+            self._dns_stop.set()
+        except Exception:
+            pass
         m, self._monitor = self._monitor, None
         if m and m is not threading.current_thread():
             m.join(timeout=8)
@@ -3209,6 +3307,28 @@ def run_self_tests():
         check("dns parse garbage", parse_query(b"\x00\x01") is None)
     except Exception as e:  # noqa: BLE001
         check("dns packet roundtrip", False, repr(e))
+    # v42: hosts sync (refresh path) converges without touching others.
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False,
+                                         encoding="utf-8") as f:
+            f.write("127.0.0.1 localhost\n1.1.1.1 a.old.com # RobloxVPN\n")
+            tmp4 = f.name
+        try:
+            a, r = _hosts_sync([("1.2.3.4", "www.roblox.com"),
+                                ("1.1.1.1", "a.old.com")], path=tmp4)
+            with open(tmp4, encoding="utf-8") as f:
+                body2 = f.read()
+            check("hosts sync converges",
+                  (a, r) == (1, 0)
+                  and "1.2.3.4 www.roblox.com" in body2
+                  and "127.0.0.1 localhost" in body2)
+            a2, r2 = _hosts_sync([("1.2.3.4", "www.roblox.com"),
+                                  ("1.1.1.1", "a.old.com")], path=tmp4)
+            check("hosts sync idempotent", (a2, r2) == (0, 0))
+        finally:
+            os.unlink(tmp4)
+    except Exception as e:  # noqa: BLE001
+        check("hosts sync converges", False, repr(e))
     # v35: CDN extension helpers -- range check + temp conf rewrite.
     check("ifindex parse", parse_default_ifindex("  14\r\n") == "14")
     check("dns servers parse",
@@ -3351,6 +3471,22 @@ def main(argv=None):
 
     if not ensure_single_instance():
         return
+
+    if os.name == "nt" and not args.mock:
+        # Heal crash residue: a dead run may leave system DNS pointed at
+        # our (now gone) local proxy, which looks like "internet down".
+        try:
+            _dif = DEFAULT_IFINDEX()
+            if _dif and crash_residue_check(get_dns_servers(_dif)):
+                _stealth_log("startup: stale proxy DNS found, restoring")
+                _orig = load_original(os.path.join(
+                    app_dir(), "dns-orig.json"))
+                if _orig:
+                    set_dns(_dif, _orig)
+                else:
+                    reset_dns(_dif)
+        except Exception:
+            pass
 
     app = VpnApp(mock=args.mock)
     app.run()
