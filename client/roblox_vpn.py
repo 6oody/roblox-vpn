@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v39"
+APP_VERSION = "v40"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -68,8 +68,13 @@ ROBLOX_HOSTS = [
     "clientsettings.roblox.com",
     "clientsettingscdn.roblox.com",
     "assetdelivery.roblox.com",
+    "assetgame.roblox.com",
     "gamepersistence.roblox.com",
     "voice.roblox.com",
+    "realtime-signalr.roblox.com",
+    "ephemeralcounters.api.roblox.com",
+    "apis.rbxcdn.com",
+    "lms-aws-us-west-2.roblox.com",
     # CDN (rbxcdn.com)
     "rbxcdn.com",
     "www.rbxcdn.com",
