@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v43"
+APP_VERSION = "v44"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -938,10 +938,13 @@ def _doh_resolve(host, timeout=5):
     """Resolve an A record via DNS-over-HTTPS (plain DNS is DPI-poisoned).
 
     Direct HTTPS to 1.1.1.1/8.8.8.8 works where port-53 DNS fails.
+    edns_client_subnet=0.0.0.0/0 disables ECS so our real subnet is
+    never disclosed to authoritative DNS (region leak: Roblox would
+    otherwise learn the real country from every lookup!).
     Returns the IPv4 string or None. Never raises.
     """
-    queries = ("https://1.1.1.1/dns-query?name=%s&type=A" % host,
-               "https://8.8.8.8/resolve?name=%s&type=A" % host)
+    queries = ("https://1.1.1.1/dns-query?name=%s&type=A&edns_client_subnet=0.0.0.0/0" % host,
+               "https://8.8.8.8/resolve?name=%s&type=A&edns_client_subnet=0.0.0.0/0" % host)
     for url in queries:
         try:
             req = urllib.request.Request(
