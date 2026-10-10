@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v44"
+APP_VERSION = "v45"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -974,6 +974,33 @@ def _hosts_add(entries, path=None):
     except OSError as e:
         _stealth_log("hosts file add failed: %s" % e)
         return 0
+
+
+# Nets that must NEVER go direct (fail-closed blackholes, persistent).
+# 128.116.0.0/17 = Roblox AS22697 (game/API/edge). 104.18.2.63/.3.63 =
+# Cloudflare anycast fronting auth.roblox.com (stable for years): reachable
+# direct (DPI allows shared-CDN IPs), so without a blackhole the client
+# leaks the real IP on every pre-connect/boot attempt. Live tunnel routes
+# (metric 6) always win over these (metric 999) while connected.
+ROBLOX_BLACKHOLE_NETS = [
+    ("128.116.0.0", "255.255.128.0"),
+    ("104.18.2.63", "255.255.255.255"),
+    ("104.18.3.63", "255.255.255.255"),
+]
+
+
+def _blackhole_ensure():
+    """Persistent fail-closed routes for Roblox nets. Never raises.
+
+    Gateway 0.0.0.0 = on-link attempt that can never resolve, so packets
+    die locally instead of leaking the real IP direct. Idempotent.
+    """
+    if os.name != "nt":
+        return
+    for addr, mask in ROBLOX_BLACKHOLE_NETS:
+        ok, out = _run(["route", "-p", "add", addr, "mask", mask,
+                        "0.0.0.0", "metric", "999"], timeout=15)
+        _stealth_log("blackhole %s: ok=%s" % (addr, ok))
 
 
 def _tun_if_index(ifname):
@@ -2117,6 +2144,12 @@ class StealthBackend:
                 os.unlink(tmp)
             except OSError:
                 pass
+        # Fail closed again: with live routes gone, the persistent
+        # blackholes must be (re)asserted so nothing leaks direct.
+        try:
+            _blackhole_ensure()
+        except Exception:
+            pass
         for net4 in ROBLOX_ALLOWED_IPS:
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
@@ -3392,6 +3425,11 @@ def run_self_tests():
             os.unlink(tmp3)
     except Exception as e:  # noqa: BLE001
         check("hosts add/remove roundtrip", False, repr(e))
+    # v45: fail-closed blackholes cover game net + auth anycast pair.
+    check("blackhole nets",
+          ("128.116.0.0", "255.255.128.0") in ROBLOX_BLACKHOLE_NETS
+          and ("104.18.2.63", "255.255.255.255") in ROBLOX_BLACKHOLE_NETS
+          and ("104.18.3.63", "255.255.255.255") in ROBLOX_BLACKHOLE_NETS)
     # v38: full domain footprint -- valid hostnames, no duplicates.
     try:
         _bad = [h for h in ROBLOX_HOSTS
@@ -3611,6 +3649,14 @@ def main(argv=None):
                     set_dns(_dif, _orig)
                 else:
                     reset_dns(_dif)
+        except Exception:
+            pass
+
+    if os.name == "nt" and not args.mock:
+        # Fail-closed blackholes BEFORE anything: no Roblox packet may
+        # ever leave direct (pre-connect boot traffic, gaps, crashes).
+        try:
+            _blackhole_ensure()
         except Exception:
             pass
 
