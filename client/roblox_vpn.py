@@ -37,7 +37,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v42"
+APP_VERSION = "v43"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -973,6 +973,19 @@ def _hosts_add(entries, path=None):
         return 0
 
 
+def _tun_if_index(ifname):
+    """Windows interface index for a TUN adapter name (via netsh)."""
+    ok, out = _run(["netsh", "interface", "ipv4", "show", "interfaces"])
+    if not ok:
+        return None
+    for line in out.splitlines():
+        if ifname.lower() in line.lower():
+            parts = line.split()
+            if parts and parts[0].isdigit():
+                return parts[0]
+    return None
+
+
 def _hosts_sync(entries, path=None):
     """Rewrite our tagged hosts lines to exactly `entries`. Returns (added, removed).
 
@@ -1459,7 +1472,45 @@ def _temp_conf_allow_all(conf_path):
         return None
 
 
-def _tun_if_index(ifname):
+# Host suffixes the auto-learner may pin (exact failing IPs only, /32).
+LEARN_SUFFIXES = (".roblox.com", ".rbxcdn.com", ".robloxlabs.com",
+                  ".arkoselabs.com", ".akamaihd.net", ".akamai.net",
+                  ".cloudfront.net", ".amazonaws.com", ".qq.com")
+
+
+def _learnable_host(host):
+    """True if host belongs to a family we auto-cover. Never raises."""
+    try:
+        h = host.lower().rstrip(".")
+        return any(h == s[1:] or h.endswith(s) for s in LEARN_SUFFIXES)
+    except Exception:
+        return False
+
+
+def _extract_failing_hosts(text):
+    """Find https hosts from player-log error lines. Returns ordered unique list."""
+    found = []
+    try:
+        for m in re.finditer(r'https?://([A-Za-z0-9.-]+)(?::\d+)?/', text):
+            h = m.group(1).lower()
+            if _learnable_host(h) and h not in found:
+                found.append(h)
+    except Exception:
+        pass
+    return found
+
+
+def _player_log_paths():
+    try:
+        base = os.path.join(os.path.expandvars("%LOCALAPPDATA%"),
+                            "Roblox", "logs")
+        out = []
+        for f in os.listdir(base):
+            if "_Player_" in f and f.endswith(".log"):
+                out.append(os.path.join(base, f))
+        return out
+    except OSError:
+        return []
     """Windows interface index for a TUN adapter name (via netsh)."""
     ok, out = _run(["netsh", "interface", "ipv4", "show", "interfaces"])
     if not ok:
@@ -1527,6 +1578,8 @@ class StealthBackend:
         self._tun_if_idx = None
         self._refresher = None
         self._dns_stop = threading.Event()
+        self._extra_hosts = []
+        self._learner = None
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -1801,17 +1854,21 @@ class StealthBackend:
             self._start_monitor()
             # NOTE: local :53 proxy retired -- port-53 answers are
             # intercepted on this box (even loopback). DNS freshness comes
-            # from the refresher (hosts + routes, every 60s).
+            # from the refresher (hosts + routes, every 60s) plus the
+            # player-log learner (wildcard for unknown hosts).
             self._dns_stop.clear()
             self._refresher = threading.Thread(target=self._refresh_loop,
                                                daemon=True)
             self._refresher.start()
+            self._learner = threading.Thread(target=self._learn_loop,
+                                             daemon=True)
+            self._learner.start()
 
     def _refresh_loop(self):
         """Re-resolve all hosts every 60s; sync hosts file + split routes.
 
-        CDN answers rotate constantly; without refresh, pins go stale
-        within minutes and images/videos die. Stops on disconnect.
+        CDN answers rotate, so pins go stale within minutes. Stops on
+        disconnect. Also picks up learner-added hosts (see _learn_loop).
         """
         while not self._dns_stop.is_set():
             self._dns_stop.wait(60)
@@ -1821,9 +1878,13 @@ class StealthBackend:
                 if self.proc is None or self.proc.poll() is not None:
                     break
                 import concurrent.futures as _fut
+                with self._state_lock:
+                    _extra = list(getattr(self, "_extra_hosts", []))
+                _targets = list(ROBLOX_HOSTS) + [h for h in _extra
+                                                 if h not in ROBLOX_HOSTS]
                 with _fut.ThreadPoolExecutor(max_workers=16) as _ex:
-                    _resolved = list(_ex.map(_doh_resolve, ROBLOX_HOSTS))
-                entries = [(ip, h) for h, ip in zip(ROBLOX_HOSTS, _resolved)
+                    _resolved = list(_ex.map(_doh_resolve, _targets))
+                entries = [(ip, h) for h, ip in zip(_targets, _resolved)
                            if ip]
                 if not entries:
                     continue
@@ -1847,6 +1908,57 @@ class StealthBackend:
                     _run(["ipconfig", "/flushdns"], timeout=15)
             except Exception as e:  # noqa: BLE001 -- never kill refresher
                 _stealth_log("dns refresh failed: %r" % e)
+
+    def _learn_loop(self):
+        """Tail Roblox player logs; auto-cover failing hosts (wildcard).
+
+        The player logs every failed URL (HttpTraceError). Any host from
+        our CDN families that the player tried and failed gets resolved
+        and picked up by the refresher within a minute -- true wildcard
+        behavior without touching port 53. Stops on disconnect.
+        """
+        seen = {}
+        while not self._dns_stop.is_set():
+            self._dns_stop.wait(30)
+            if self._dns_stop.is_set():
+                break
+            try:
+                if self.proc is None or self.proc.poll() is not None:
+                    break
+                with self._state_lock:
+                    known = set(ROBLOX_HOSTS) | set(
+                        getattr(self, "_extra_hosts", []))
+                fresh = []
+                for p in _player_log_paths():
+                    try:
+                        mtime = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    prev_off, prev_mtime = seen.get(p, (0, 0))
+                    if mtime < prev_mtime:
+                        prev_off = 0  # rotated/truncated
+                    try:
+                        with open(p, encoding="utf-8",
+                                  errors="replace") as f:
+                            f.seek(prev_off)
+                            chunk = f.read(1 << 20)
+                            seen[p] = (f.tell(), mtime)
+                    except OSError:
+                        continue
+                    for h in _extract_failing_hosts(chunk):
+                        if h not in known and h not in fresh:
+                            fresh.append(h)
+                if fresh:
+                    with self._state_lock:
+                        cur = list(getattr(self, "_extra_hosts", []))
+                        for h in fresh:
+                            if h not in ROBLOX_HOSTS and h not in cur \
+                                    and len(cur) < 64:
+                                cur.append(h)
+                        self._extra_hosts = cur
+                    _stealth_log("auto-learned hosts: %s" % fresh)
+            except Exception as e:  # noqa: BLE001
+                _stealth_log("learn loop failed: %r" % e)
 
     def _proxy_route(self, ip):
         """Route one proxy-resolved IP via the tunnel. Never raises."""
@@ -3307,6 +3419,17 @@ def run_self_tests():
         check("dns parse garbage", parse_query(b"\x00\x01") is None)
     except Exception as e:  # noqa: BLE001
         check("dns packet roundtrip", False, repr(e))
+    # v43: log-learner pure logic (wildcard coverage proof).
+    check("learn suffix yes",
+          _learnable_host("x9.akamaihd.net") is True)
+    check("learn suffix no",
+          _learnable_host("evil.com") is False
+          and _learnable_host("notroblox.com.evil.com") is False)
+    _sample = ('error url:{ "https://foo.rbxcdn.com/a/b" } '
+               'and https://Bar.ROBLOX.COM:443/x plus https://google.com/y')
+    check("learn extract",
+          _extract_failing_hosts(_sample) == ["foo.rbxcdn.com",
+                                              "bar.roblox.com"])
     # v42: hosts sync (refresh path) converges without touching others.
     try:
         with tempfile.NamedTemporaryFile("w", delete=False,
